@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+data/
+in/
+**/uploads/
+logs/
+*.log
+config/style_rules.json
+config/corrections.jsonl
+config/canon.jsonl
+config/voiceprint.txt
+
+# legacy local files
+tuner.py
+tuner.py.bak*
+tullman_app.py
