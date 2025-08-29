@@ -1,0 +1,448 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="Cache-Control" content="no-store"/>
+<title>Loop Test - Tullman.ai</title>
+<style>
+body{background:#0b0b0c;color:#e8e8ea;font:16px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:0}
+.wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+.h{font-weight:800;font-size:20px;margin:10px 0}
+.card{background:#141416;border:1px solid #232329;border-radius:14px;padding:16px;margin:14px 0}
+.lab{color:#a9abb3;font-size:14px;margin:6px 0}
+textarea,input[type=text]{width:100%;background:#0d0d0f;color:#e8e8ea;border:1px solid #232329;border-radius:10px;padding:10px;font:15px/1.4 ui-monospace,Menlo,Consolas,monospace}
+.btn{display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid #2a2a31;background:#19191c;color:#e8e8ea;margin-right:8px;font-weight:700;cursor:pointer}
+.btn.ok{border-color:#1e644b;background:#0f3225}
+.btn.bad{border-color:#612030;background:#2a121a}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.twocol{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.status{color:#a9abb3;font-size:14px;margin-left:8px}
+.hide{display:none}
+textarea[readonly]{opacity:.9}
+
+/* spacing for Box 6 compare panes */
+.twocol textarea{margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Loop Test - Ask -> Compare -> Correct -> Retrain -> Re-ask</h2>
+
+  <!-- Box 1 -->
+  <div class="card">
+    <div class="h">Box 1 - Ask Question</div>
+    <input id="q" type="text" placeholder="Type your question..."/>
+    <div class="row" style="margin-top:6px">
+      <button id="ask" class="btn ok" type="button">Submit</button>
+      <span id="msg" class="status"></span>
+    </div>
+  </div>
+
+  <!-- Box 2 -->
+  <div class="card">
+    <div class="h">Box 2 - System Response</div>
+    <textarea id="a1" rows="7" readonly placeholder="(first answer will appear here)"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button id="accept"   class="btn ok"  type="button">Accept</button>
+      <button id="editopen" class="btn"     type="button">Edit</button>
+      <button id="reject"   class="btn bad" type="button">Reject</button>
+    </div>
+  </div>
+
+  <!-- Box 3 -->
+  <div class="card hide" id="editbox">
+    <div class="h">Box 3 - Edit System Response</div>
+    <textarea id="a1edit" rows="7" placeholder="Edit the system response..."></textarea>
+    <div class="row" style="margin-top:6px">
+      <button id="editsubmit" class="btn ok" type="button">Submit</button>
+      <button id="editcancel" class="btn"    type="button">Cancel Edit</button>
+      <button id="retrain1"   class="btn"    type="button">Retrain</button>
+    </div>
+  </div>
+
+  <!-- Box 4 -->
+  <div class="card">
+    <div class="h">Box 4 - Add New Corrective Content</div>
+    <input id="tag" type="text" placeholder="Topic/Tag (optional)"/>
+    <textarea id="support" rows="5" placeholder="Paste corrective notes, bullets, or context..."></textarea>
+    <div class="row" style="margin-top:6px">
+      <button id="supportsubmit" class="btn ok" type="button">Submit</button>
+      <button id="retrain2"      class="btn"    type="button">Retrain</button>
+    </div>
+  </div>
+
+  <!-- Box 5 -->
+  <div class="card">
+    <div class="h">Box 5 - Ask Again (same question)</div>
+    <button id="askagain" class="btn ok" type="button">Submit</button>
+  </div>
+
+  <!-- Box 6 -->
+  <div class="card">
+    <div class="h">Box 6 - New System Response (compare to Box 2)</div>
+    <div class="twocol">
+      <div>
+        <div class="lab">Previous (Box 2)</div>
+<div id="box6Actions" class="row" style="margin:8px 0 0">
+  <button id="b6Accept" class="btn ok" type="button">Accept</button>
+  <button id="b6Edit"   class="btn"    type="button">Edit</button>
+  <button id="b6AddVP"  class="btn"    type="button">Add to Voiceprint</button>
+  <span id="b6Msg" class="status"></span>
+</div>
+        <textarea id="a1copy" rows="7" readonly></textarea>
+      </div>
+      <div>
+        <div class="lab">New (Box 6)</div>
+        <textarea id="a2" rows="7" readonly placeholder="(re-ask result)"></textarea>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const msg = t => { const m=$('#msg'); if(!m) return; m.textContent=t; setTimeout(()=>m.textContent='',1600); };
+const postJSON = (u,o) => fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).then(r=>r.json());
+const postForm = (u,m) => { const fd=new FormData(); Object.entries(m).forEach(([k,v])=>fd.append(k,v)); return fetch(u,{method:'POST',body:fd}); };
+
+// Box 1 -> 2
+$('#ask').addEventListener('click', async ()=>{
+  const q=($('#q').value||'').trim(); if(!q) return msg('Enter a question');
+  try{ const j=await postJSON('/retrieve',{prompt:q}); const a=(j&&j.answer||'').trim();
+       $('#a1').value=a||'(empty)'; $('#a1copy').value=a||''; msg('OK'); }catch{ msg('Ask error'); }
+});
+
+// Box 2 actions
+$('#accept').addEventListener('click', async ()=>{
+  const q=($('#q').value||'').trim(), a=($('#a1').value||'').trim(); if(!q||!a) return msg('Nothing to save');
+  try{ await postForm('/admin/api/index_text',{title:q,text:a}); msg('Saved'); }catch{ msg('Save error'); }
+});
+$('#editopen').addEventListener('click', ()=>{ $('#a1edit').value=($('#a1').value||'').trim(); $('#editbox').classList.remove('hide'); });
+$('#editcancel').addEventListener('click', ()=>$('#editbox').classList.add('hide'));
+$('#reject').addEventListener('click', ()=>{ $('#a1').value=''; msg('Rejected'); });
+
+// Box 3 submit + retrain
+$('#editsubmit').addEventListener('click', async ()=>{
+  const q=($('#q').value||'').trim(), a=($('#a1edit').value||'').trim(); if(!q||!a) return msg('Nothing to save');
+  try{ await postForm('/admin/api/index_text',{title:q,text:a}); $('#a1').value=a; $('#a1copy').value=a; $('#editbox').classList.add('hide'); msg('Saved (edited)'); }catch{ msg('Save error'); }
+});
+$('#retrain1').addEventListener('click', async ()=>{ try{ await fetch('/tuner/rebuild',{method:'POST'}); msg('Retrained'); }catch{ msg('Retrain failed'); } });
+
+// Box 4 submit + retrain
+$('#supportsubmit').addEventListener('click', async ()=>{
+  const tag=($('#tag').value||'(admin note)').trim(), text=($('#support').value||'').trim(); if(!text) return msg('Nothing to add');
+  try{ await postForm('/admin/api/index_text',{title:tag,text:text}); msg('Added'); }catch{ msg('Add failed'); }
+});
+$('#retrain2').addEventListener('click', async ()=>{ try{ await fetch('/tuner/rebuild',{method:'POST'}); msg('Retrained'); }catch{ msg('Retrain failed'); } });
+
+// Box 5 -> 6 (re-ask)
+$('#askagain').addEventListener('click', async ()=>{
+  const q=($('#q').value||'').trim(); if(!q) return msg('Enter the original question');
+  try{ const j=await postJSON('/retrieve',{prompt:q}); $('#a2').value=(j&&j.answer||'').trim()||'(empty)'; msg('Asked again'); }catch{ msg('Ask-again error'); }
+});
+</script>
+
+<!-- Box 6 Actions -->
+<div class="card" id="box6actions">
+  <div class="h">Box 6 — Actions for New Response</div>
+  <div class="row" style="margin-top:6px">
+    <button id="loopAccept2"    class="btn ok"  type="button">Accept</button>
+    <button id="loopEdit2Open"  class="btn"     type="button">Edit</button>
+    <button id="loopAddVoice"   class="btn"     type="button">Add to Voiceprint</button>
+  </div>
+</div>
+
+<!-- Box 6 Edit area -->
+<div class="card hide" id="editbox2">
+  <div class="h">Edit New Response (Box 6)</div>
+  <textarea id="a2edit" rows="7" placeholder="Edit the new response…"></textarea>
+  <div class="row" style="margin-top:6px">
+    <button id="editsubmit2" class="btn ok" type="button">Submit</button>
+    <button id="editcancel2" class="btn"    type="button">Cancel Edit</button>
+  </div>
+</div>
+
+<script>(function(){try{var cards=[].slice.call(document.querySelectorAll(".card"));for(var i=0;i<cards.length;i++){var h=cards[i].querySelector(".h");if(h && /Box\s*6/i.test(h.textContent) && /Actions/i.test(h.textContent)){var btn=cards[i].querySelector(".row");var prev=cards[i].previousElementSibling; if(btn && prev && prev.classList.contains("card")){btn.style.marginTop="10px"; prev.appendChild(btn);} cards[i].parentNode.removeChild(cards[i]); break;}}}catch(e){}})();</script>
+<div class="row">
+    <span id="b6Msg" class="status"></span>
+  </div>
+</div>
+<script src="/assets/loop_patch.js?v=1756479287"></script>
+</body>
+</html>
+<script>
+(function(){
+  try {
+    const $ = (sel, root=document) => root.querySelector(sel);
+    const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+
+    // Find a card by its heading text prefix, e.g. "Box 5 - Ask Again"
+    function findCardByHeading(prefix){
+      for (const h of $$(".card .h")) {
+        if ((h.textContent||"").trim().toLowerCase().startsWith(prefix.toLowerCase())) {
+          return h.closest(".card");
+        }
+      }
+      return null;
+    }
+
+    // ---- Box 5: Add missing textarea (optional rephrase) ----
+    const box5 = findCardByHeading("Box 5 - Ask Again");
+    if (box5 && !$("#loopQ2")) {
+      const ta=document.createElement("textarea");
+      ta.id="loopQ2"; ta.rows=2;
+      ta.placeholder="(optional) rephrase or leave blank to reuse Box 1…";
+      ta.style.margin = "8px 0";
+      const refRow = $(".row", box5);
+      box5.insertBefore(ta, refRow ? refRow : box5.lastChild);
+    }
+
+    // ---- Box 6: Actions card under Box 6 ----
+    const box6 = findCardByHeading("Box 6 - New System Response");
+    if (box6 && !$("#box6Actions")) {
+      const actions = document.createElement("div");
+      actions.className = "card";
+      actions.id = "box6Actions";
+      actions.style.marginTop = "8px";
+      actions.innerHTML = `
+        <div class="h">Box 6 — Actions</div>
+        <div class="row">
+          <span id="b6Msg" class="status"></span>
+        </div>`;
+      box6.parentNode.insertBefore(actions, box6.nextSibling);
+    }
+
+    // ---- Helpers to access fields across boxes ----
+    function getQ1(){ return $("#loopQ") || $("#q") || $("input[type=text]"); }
+    function getQ2(){ return $("#loopQ2"); }
+
+    function getBox2(){
+      return findCardByHeading("Box 2 - System Response") || findCardByHeading("Box 2");
+    }
+    function getA1(){ // first answer (Box 2)
+      const b2 = getBox2();
+      if (b2) {
+        const tas = $$("textarea", b2);
+        if (tas.length) return tas[0];
+      }
+      return $("#loopA1") || $("#a1") || $$("textarea")[1] || null;
+    }
+    function getA2(){ // new answer (right textarea in Box 6)
+      // Try explicit ids then fallbacks
+      return $("#loopA2") || $("#a2") ||
+             ($$("textarea", box6).slice(-1)[0]) ||
+             $$("textarea").slice(-1)[0] || null;
+    }
+    function getA2Prev(){ // left textarea in Box 6
+      if (!box6) return null;
+      const tas = $$("textarea", box6);
+      return tas.length >= 2 ? tas[0] : null;
+    }
+
+    // ---- Box 5 Submit: re-ask -> fill Box 6 (and copy previous) ----
+    (function wireBox5(){
+      if (!box5) return;
+      const askBtn = $("button", box5) || $(".btn", box5);
+      if (!askBtn) return;
+      askBtn.addEventListener("click", async ()=>{
+        const msg = $("#b6Msg") || $(".status", $("#box6Actions")||document);
+        const q2 = (getQ2() && getQ2().value.trim()) || (getQ1() && getQ1().value.trim()) || "";
+        try {
+          if (msg) msg.textContent = "Re-asking…";
+          const r = await fetch("/retrieve", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({prompt: q2})
+          });
+          const txt = await r.text();
+          let j={}; try { j = JSON.parse(txt); } catch { if(msg) msg.textContent="Bad JSON"; return; }
+          const prev = getA2Prev(), oldA = getA1();
+          if (prev && oldA) prev.value = (oldA.value||"").trim();
+          const a2 = getA2(); if (a2) a2.value = (j.answer||"").trim();
+          if (msg) msg.textContent = "Done.";
+        } catch(e) { if (msg) msg.textContent = "Network error"; }
+      });
+    })();
+
+    // ---- Box 6: Accept -> save Q/A into examples seed ----
+    (function wireActions(){
+      const bAccept = $("#b6Accept"), bEdit = $("#b6Edit"), bAddVP=$("#b6AddVP"), msg=$("#b6Msg");
+      if (bAccept) bAccept.addEventListener("click", async ()=>{
+        const q = (getQ1() && getQ1().value.trim()) || "";
+        const a = (getA2() && getA2().value.trim()) || "";
+        try {
+          if(msg) msg.textContent = "Saving…";
+          const payload = { text: `Q: ${q}\nA: ${a}\n` };
+          const r = await fetch("/admin/api/examples_text", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify(payload)
+          });
+          const j = await r.json();
+          if (msg) msg.textContent = (j && j.ok) ? "Saved to examples." : "Error";
+        } catch(e) { if (msg) msg.textContent="Network error"; }
+      });
+
+      if (bEdit) {
+        let editing=false, last="";
+        bEdit.addEventListener("click", ()=>{
+          else { a2.setAttribute("readonly","readonly"); bEdit.textContent="Edit"; editing=false; }
+        });
+      }
+
+      if (bAddVP) bAddVP.addEventListener("click", async ()=>{
+        const a = (getA2() && getA2().value.trim()) || "";
+        if (alias_block = () { if($("#b6Msg")) $("#b6Msg").textContent="Nothing to append"; return; }
+        try {
+          if($("#b6Msg")) $("#b6Msg").textContent="Appending…";
+          const r = await fetch("/admin/api/voiceprint", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({ text: a, mode: "append" })
+          });
+          const j = await r.json();
+          if($("#b6Msg")) $("#b6Msg").textContent = (j && j.ok) ? "Appended to voiceprint." : "Error";
+        } catch (e) {
+          if($("#b6Msg")) $("#b6Msg").textContent="Network error";
+        }
+      });
+    })();
+
+  } catch(e) { /* ignore */ }
+})();
+</script>
+<script>
+(function(){
+  try{
+    var $ = function(sel, root){ return (root||document).querySelector(sel); };
+    var $$ = function(sel, root){ return Array.prototype.slice.call((root||document).querySelectorAll(sel)); };
+
+    function findCard(prefix){
+      var hs = $$(".card .h");
+      for (var i=0;i<hs.length;i++){
+        var t = (hs[i].textContent||"").trim().toLowerCase();
+        if (t.indexOf(prefix.toLowerCase()) === 0) return hs[i].closest(".card");
+      }
+      return null;
+    }
+
+    // --- Box 5: ensure textarea present ---
+    var box5 = findCard("Box 5 - Ask Again");
+    if (box5 && !$("#loopQ2", box5)){
+      var ta = document.createElement("textarea");
+      ta.id = "loopQ2"; ta.rows = 2;
+      ta.placeholder = "(optional) rephrase or leave blank to reuse Box 1…";
+      ta.style.margin = "8px 0";
+      var firstRow = $(".row", box5);
+      box5.insertBefore(ta, firstRow ? firstRow : box5.lastChild);
+    }
+
+    // --- Box 6: ensure actions buttons present ---
+    var box6 = findCard("Box 6 - New System Response");
+    if (box6 && !$("#box6Actions")){
+      var actions = document.createElement("div");
+      actions.className = "card";
+      actions.id = "box6Actions";
+      actions.style.marginTop = "8px";
+      actions.innerHTML =
+        '<div class="h">Box 6 — Actions</div>' +
+        '<div class="row">' +
+          '<span id="b6Msg" class="status"></span>' +
+        '</div>';
+      box6.parentNode.insertBefore(actions, box6.nextSibling);
+    }
+
+    // Give the two Box-6 textareas some breathing room
+    var tw = $(".twocol", box6 || document);
+    if (tw){ tw.style.gap = "14px"; tw.style.columnGap = "14px"; }
+
+    // ----- helpers -----
+    function getQ1(){ return $("#loopQ") || $("#q") || $("input[type=text]"); }
+    function getQ2(){ return $("#loopQ2"); }
+
+    function getA1(){ // Box 2 answer
+      var b2 = findCard("Box 2 - System Response") || findCard("Box 2");
+      if (b2){ var ta=$$("textarea", b2); if (ta.length) return ta[0]; }
+      var tas = $$("textarea"); return tas.length>1 ? tas[1] : null;
+    }
+    function getA2(){ // Box 6 new (right)
+      if (!box6) return null;
+      var tas = $$("textarea", box6);
+      return tas.length ? tas[tas.length-1] : null;
+    }
+    function getA2Prev(){ // Box 6 previous (left)
+      if (!box6) return null;
+      var tas = $$("textarea", box6);
+      return tas.length ? tas[0] : null;
+    }
+
+    // ----- Box 5: Submit -> re-ask -----
+    (function(){
+      if (!box5) return;
+      var askBtn = $("button", box5) || $(".btn", box5);
+      if (!askBtn) return;
+      askBtn.addEventListener("click", function(){
+        var msg = $("#b6Msg") || $(".status", $("#box6Actions")||document);
+        var q2 = (getQ2() && getQ2().value.trim()) || (getQ1() && getQ1().value.trim()) || "";
+        if (!q2){ if(msg) msg.textContent="Enter a question"; return; }
+        if (msg) msg.textContent="Re-asking…";
+        fetch("/retrieve", {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({prompt:q2})
+        }).then(function(r){return r.text();}).then(function(txt){
+          var j={}; try{ j=JSON.parse(txt);}catch(e){ if(msg) msg.textContent="Bad JSON"; return; }
+          var prev=getA2Prev(), oldA=getA1();
+          if (prev && oldA) prev.value=(oldA.value||"").trim();
+          var a2=getA2(); if (a2) a2.value=(j.answer||"").trim();
+          if (msg) msg.textContent="Done.";
+        }).catch(function(){ if(msg) msg.textContent="Network error"; });
+      });
+    })();
+
+    // ----- Box 6: Accept / Edit / Add to Voiceprint -----
+    (function(){
+      var bAccept=$("#b6Accept"), bEdit=$("#b6Edit"), bAddVP=$("#b6AddVP"), msg=$("#b6Msg");
+
+      if (bAccept){
+        bAccept.addEventListener("click", function(){
+          var q=(getQ1()&&getQ1().value.trim())||"";
+          var a=(getA2()&&getA2().value.trim())||"";
+          if (!q || !a){ if(msg) msg.textContent="Nothing to save"; return; }
+          if (msg) msg.textContent="Saving…";
+          fetch("/admin/api/examples_text", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({ text: "Q: "+q+"\nA: "+a+"\n" })
+          }).then(function(r){return r.json();}).then(function(j){
+            if (msg) msg.textContent = (j && j.ok) ? "Saved to examples." : "Error";
+          }).catch(function(){ if(msg) msg.textContent="Network error"; });
+        });
+      }
+
+      if (bEdit){
+        var editing=false;
+        bEdit.addEventListener("click", function(){
+          var a2=getA2(); if (!a2) return;
+          if (!editing){ a2.removeAttribute("readonly"); a2.focus(); bEdit.textContent="Save"; editing=true; }
+          else{ a2.setAttribute("readonly","readonly"); bEdit.textContent="Edit"; editing=false; }
+        });
+      }
+
+      if (bAddVP){
+        bAddVP.addEventListener("click", function(){
+          var a=(getA2()&&getA2().value.trim())||"";
+          if (!a){ if($("#b6Msg")) $("#b6Msg").textContent="Nothing to append"; return; }
+          if ($("#b6Msg")) $("#b6Msg").textContent="Appending…";
+          fetch("/admin/api/voiceprint", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({ text: a, mode: "append" })
+          }).then(function(r){return r.json();}).then(function(j){
+            if ($("#b6Msg")) $("#b6Msg").textContent = (j && j.ok) ? "Appended to voiceprint." : "Error";
+          }).catch(function(){ if($("#b6Msg")) $("#b6Msg").textContent="Network error"; });
+        });
+      }
+    })();
+
+  }catch(e){}
+})();
+</script>

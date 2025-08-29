@@ -1,0 +1,323 @@
+# /home/kmages/backend/admin_ui.py
+from __future__ import annotations
+
+import os, json, uuid, subprocess, datetime, shutil, pickle
+from typing import List, Dict, Any
+from flask import Blueprint, request, render_template, redirect, url_for, flash, jsonify
+
+admin_bp = Blueprint("admin", __name__, template_folder="templates")
+
+# ── paths
+BASE_DIR      = "/home/kmages"
+BACKEND_DIR   = f"{BASE_DIR}/backend"
+UPLOAD_DIR    = f"{BACKEND_DIR}/uploads"
+QUEUE_PATH    = f"{BACKEND_DIR}/admin_queue.jsonl"
+GOLDEN_PATH   = f"{BASE_DIR}/golden.jsonl"
+FAISS_DIR     = f"{BASE_DIR}/just-ken-GPT/golden_faiss_index"
+REINDEX_PY    = f"{BACKEND_DIR}/admin_reindex_incremental.py"
+VENV_PYTHON   = f"{BACKEND_DIR}/venv/bin/python"
+VOICEPRINT_TXT= f"{BACKEND_DIR}/kenifier_prompt.txt"
+SEED_JSONL    = f"{BACKEND_DIR}/voiceprint_seed.jsonl"
+TUNER_PY      = f"{BACKEND_DIR}/tuner_build_seed.py"
+
+# feature toggles
+REINDEX_ENABLED = os.getenv("ADMIN_REINDEX_ENABLED", "0") in ("1","true","True","yes","on")
+REQUIRE_KEY = False
+ADMIN_KEY   = os.getenv("ADMIN_KEY","")
+
+# ── helpers
+def now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+def ensure_dirs() -> None:
+    os.makedirs(os.path.dirname(QUEUE_PATH), exist_ok=True)
+    if not os.path.exists(QUEUE_PATH):
+        open(QUEUE_PATH, "a", encoding="utf-8").close()
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    if REINDEX_ENABLED:
+        os.makedirs(FAISS_DIR, exist_ok=True)
+
+def read_queue() -> List[Dict[str, Any]]:
+    ensure_dirs()
+    out: List[Dict[str, Any]] = []
+    with open(QUEUE_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            try: out.append(json.loads(line))
+            except Exception: pass
+    out.sort(key=lambda x: x.get("timestamp",""), reverse=True)
+    return out
+
+def write_queue(items: List[Dict[str, Any]]) -> None:
+    tmp = QUEUE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+    os.replace(tmp, QUEUE_PATH)
+
+def append_to_golden(prompt: str, response: str, meta: Dict[str,Any]|None=None) -> None:
+    entry = {
+        "prompt": (prompt or "").strip(),
+        "response": (response or "").strip(),
+        "source": (meta or {}).get("source", "admin_upload"),
+        "date": now_iso(),
+    }
+    if meta:
+        entry.update({k:v for k,v in meta.items() if k not in ("prompt","response")})
+    with open(GOLDEN_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def _py() -> str:
+    return VENV_PYTHON if os.path.exists(VENV_PYTHON) else "python3"
+
+def kick_reindex_async(text: str) -> None:
+    try:
+        if not REINDEX_ENABLED: return
+        if not text or not text.strip(): return
+        if not os.path.exists(REINDEX_PY): return
+        os.makedirs(FAISS_DIR, exist_ok=True)
+        subprocess.Popen(
+            [_py(), REINDEX_PY, "--text", text.strip(), "--faiss_dir", FAISS_DIR],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+        )
+    except Exception:
+        return
+
+def require_admin_key() -> bool:
+    if not REQUIRE_KEY: return True
+    key = request.args.get("key") or request.headers.get("x-admin-key")
+    return bool(key and ADMIN_KEY and key == ADMIN_KEY)
+
+# ── extractors (lazy import so missing libs don’t crash the server)
+def _extract_text_from_pdf(path: str) -> str:
+    try:
+        from pdfminer.high_level import extract_text
+        return (extract_text(path) or "").strip()
+    except Exception:
+        return ""
+
+def _extract_text_from_docx(path: str) -> str:
+    try:
+        from docx import Document
+        doc = Document(path)
+        parts = []
+        for p in doc.paragraphs:
+            txt = (p.text or "").strip()
+            if txt:
+                parts.append(txt)
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+
+# ── routes (single page admin)
+@admin_bp.route("/admin")
+def admin_home():
+    if not require_admin_key(): return "Unauthorized", 401
+    items = read_queue()
+    pending  = [i for i in items if i.get("status") in (None,"","pending")]
+    approved = [i for i in items if i.get("status") == "approved"]
+    rejected = [i for i in items if i.get("status") == "rejected"]
+    return render_template(
+        "admin.html",
+        counts={"pending":len(pending),"approved":len(approved),"rejected":len(rejected)},
+        pending=pending, approved=approved, rejected=rejected,
+    )
+
+@admin_bp.route("/admin/save", methods=["POST"])
+def admin_save():
+    if not require_admin_key(): return "Unauthorized", 401
+    item_id = (request.form.get("id") or "").strip()
+    edited  = (request.form.get("edited") or "").strip()
+    if not item_id or not edited:
+        flash("Missing id or edited text","error")
+        return redirect(url_for("admin.admin_home"))
+
+    items = read_queue()
+    found = next((it for it in items if it.get("id")==item_id), None)
+    if not found:
+        flash("Item not found","error"); return redirect(url_for("admin.admin_home"))
+
+    append_to_golden(found.get("prompt",""), edited, {"source":"Howard edit"})
+
+    found["status"]="approved"
+    found["edited_response"]=edited
+    found["approved_at"]=now_iso()
+    write_queue(items)
+
+    kick_reindex_async(edited)
+    flash("Saved to corpus.","success")
+    return redirect(url_for("admin.admin_home"))
+
+@admin_bp.route("/admin/reject", methods=["POST"])
+def admin_reject():
+    if not require_admin_key(): return "Unauthorized", 401
+    item_id = (request.form.get("id") or "").strip()
+    if not item_id:
+        flash("Missing id","error"); return redirect(url_for("admin.admin_home"))
+    items = read_queue()
+    for it in items:
+        if it.get("id")==item_id:
+            it["status"]="rejected"; it["rejected_at"]=now_iso(); break
+    write_queue(items)
+    flash("Rejected.","info")
+    return redirect(url_for("admin.admin_home"))
+
+def log_to_queue(prompt: str, response_raw: str) -> None:
+    ensure_dirs()
+    row = {"id":str(uuid.uuid4()),"timestamp":now_iso(),"status":"pending",
+           "prompt":prompt,"response_raw":response_raw}
+    with open(QUEUE_PATH,"a",encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False)+"\n")
+
+# ── voiceprint load/save
+
+
+@admin_bp.route("/admin/api/voiceprint", methods=["GET","POST"])
+def api_voiceprint():
+    if not require_admin_key(): 
+        return "Unauthorized", 401
+
+    # compute paths locally so missing globals don't crash
+    STG  = VOICEPRINT_STG if 'VOICEPRINT_STG' in globals() else os.path.join(BACKEND_DIR,"voiceprint_staging.txt")
+    PROD = VOICEPRINT_PROD if 'VOICEPRINT_PROD' in globals() else os.path.join(BACKEND_DIR,"voiceprint_prod.txt")
+    LEG  = VOICEPRINT_TXT
+    PRPT = PROMPT_TXT
+
+    def _read(path):
+        try:
+            with open(path,"r",encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    if request.method == "GET":
+        for cand in (STG, PROD, LEG, PRPT):
+            txt = _read(cand)
+            if txt:
+                return jsonify({"ok": True, "text": txt, "path": cand})
+        return jsonify({"ok": True, "text": "", "path": None})
+
+    # POST: save to STAGING, backup STG/LEG/PRPT
+    text = (request.form.get("text") or (request.json or {}).get("text") or "").rstrip()
+    os.makedirs(BACKEND_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    for fp in (STG, LEG, PRPT):
+        try:
+            if os.path.exists(fp): shutil.copy2(fp, f"{fp}.bak.{ts}")
+        except Exception:
+            pass
+    with open(STG,"w",encoding="utf-8") as f:
+        f.write((text or "") + "
+")
+    for fp in (LEG, PRPT):
+        try:
+            with open(fp,"w",encoding="utf-8") as f:
+                f.write((text or "") + "
+")
+        except Exception:
+            pass
+    return jsonify({"ok": True, "path": STG, "bytes": len((text or '').encode('utf-8'))})
+
+@admin_bp.route("/tuner/rebuild", methods=["POST"])
+def tuner_rebuild():
+    try:
+        if not os.path.exists(TUNER_PY):
+            return jsonify({"ok":False,"error":"tuner_build_seed.py not found"}), 500
+        out = subprocess.check_output([_py(), TUNER_PY], stderr=subprocess.STDOUT, text=True)
+        return jsonify({"ok":True,"log":out})
+    except subprocess.CalledProcessError as e:
+        return jsonify({"ok":False,"error":e.output}), 500
+
+# ── upload docs (txt/md/jsonl/pdf/docx ingested immediately)
+@admin_bp.route("/admin/api/upload", methods=["POST"])
+def api_upload():
+    if not require_admin_key(): return "Unauthorized", 401
+    ensure_dirs()
+    files = request.files.getlist("files")
+    saved, ingested = [], 0
+    for f in files:
+        name = f.filename or "upload.bin"
+        dest = os.path.join(UPLOAD_DIR, name)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        f.save(dest)
+        saved.append(name)
+
+        lower = name.lower()
+        try:
+            if lower.endswith((".txt", ".md")):
+                with open(dest,"r",encoding="utf-8",errors="ignore") as fin:
+                    text = fin.read()
+                if text.strip():
+                    append_to_golden(f"(file) {name}", text, {"source":"admin_upload","filename":name})
+                    ingested += 1
+            elif lower.endswith(".jsonl"):
+                # append each JSONL line into golden.jsonl as a pass-through
+                with open(dest, "r", encoding="utf-8", errors="ignore") as fin:
+                    for line in fin:
+                        line=line.strip()
+                        if not line: continue
+                        try:
+                            obj=json.loads(line)
+                            prompt=obj.get("prompt","(jsonl import)")
+                            response=obj.get("response","")
+                            meta={"source":obj.get("source","jsonl_import"),"filename":name}
+                            append_to_golden(prompt, response, meta)
+                            ingested += 1
+                        except Exception:
+                            # fall back: store raw line as response text
+                            append_to_golden(f"(jsonl) {name}", line, {"source":"jsonl_import_raw","filename":name})
+                            ingested += 1
+            elif lower.endswith(".pdf"):
+                text = _extract_text_from_pdf(dest)
+                if text:
+                    append_to_golden(f"(pdf) {name}", text, {"source":"admin_upload_pdf","filename":name})
+                    ingested += 1
+            elif lower.endswith(".docx"):
+                text = _extract_text_from_docx(dest)
+                if text:
+                    append_to_golden(f"(docx) {name}", text, {"source":"admin_upload_docx","filename":name})
+                    ingested += 1
+            else:
+                # Unsupported type right now: keep saved in uploads
+                pass
+        except Exception:
+            # Continue other files even if one fails
+            pass
+
+    return jsonify({"ok":True,"saved":saved,"ingested":ingested})
+
+# ── quick index: paste text → corpus now
+@admin_bp.route("/admin/api/index_text", methods=["POST"])
+def api_index_text():
+    if not require_admin_key(): return "Unauthorized", 401
+    title = (request.form.get("title") or (request.json or {}).get("title") or "").strip()
+    text  = (request.form.get("text")  or (request.json or {}).get("text")  or "").strip()
+    if not text:
+        return jsonify({"ok":False,"error":"empty text"}), 400
+    append_to_golden(title or "(admin note)", text, {"source":"admin_index_text"})
+    return jsonify({"ok":True})
+
+
+@admin_bp.route("/admin/save_raw", methods=["POST"])
+def admin_save_raw():
+    """Save the model's raw answer to the corpus (Approve as-is)."""
+    if not require_admin_key(): return "Unauthorized", 401
+    item_id = (request.form.get("id") or "").strip()
+    if not item_id:
+        flash("Missing id","error")
+        return redirect(url_for("admin.admin_home"))
+    items = read_queue()
+    found = next((it for it in items if it.get("id")==item_id), None)
+    if not found:
+        flash("Item not found","error")
+        return redirect(url_for("admin.admin_home"))
+    prompt = (found.get("prompt") or "").strip()
+    raw    = (found.get("response_raw") or "").strip()
+    append_to_golden(prompt, raw, {"source":"Howard approve (raw)"})
+    found["status"]="approved"
+    found["approved_at"]=now_iso()
+    write_queue(items)
+    flash("Saved to corpus (as-is).","success")
+    return redirect(url_for("admin.admin_home"))
+

@@ -1,0 +1,117 @@
+<!-- /home/kmages/backend/templates/admin.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Review Queue — Edit & Approve</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    :root { --bg:#0b0b0c; --card:#141416; --ink:#e8e8ea; --muted:#a9abb3; --ok:#3ccf91; --warn:#ffd166; --bad:#ef476f; }
+    html,body{background:var(--bg);color:var(--ink);font:18px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:0;}
+    .wrap{max-width:980px;margin:24px auto;padding:0 16px;}
+    .top{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+    .pill{padding:8px 12px;border-radius:999px;background:var(--card);border:1px solid #242428;color:var(--muted);font-size:15px}
+    .pill b{color:var(--ink)}
+    .btn{cursor:pointer;border-radius:12px;border:1px solid #2a2a31;background:#19191c;color:var(--ink);padding:12px 16px;font-weight:700;font-size:16px}
+    .btn.primary{border-color:#1e644b;background:#0f3225}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .status{font-size:16px;color:var(--muted);margin-left:6px}
+    .card{background:var(--card);border:1px solid #232329;border-radius:16px;padding:16px;margin:16px 0}
+    .ts{color:var(--muted);font-size:14px;margin-bottom:6px}
+    .h{margin:8px 0 2px;font-size:16px;color:#c9c9cf}
+    .mono{background:#0e0e10;border:1px solid #222229;border-radius:12px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap}
+    textarea{width:100%;min-height:150px;background:#0d0d0f;border:1px solid #222229;border-radius:12px;color:var(--ink);padding:12px;font:16px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .row{display:flex;gap:10px;margin-top:12px}
+    .ok{border-color:#1e644b;background:#0f3225}
+    .bad{border-color:#612030;background:#2a121a}
+    .flash{background:#15202b;border:1px solid #22303c;padding:12px;border-radius:12px;margin-bottom:12px}
+    a{color:#89b4ff;text-decoration:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Review Queue — Edit & Approve</h2>
+
+    <div class="top">
+      <span class="pill">Pending: <b>{{ counts.pending }}</b></span>
+      <span class="pill">Approved: <b>{{ counts.approved }}</b></span>
+      <span class="pill">Rejected: <b>{{ counts.rejected }}</b></span>
+
+      <!-- One‑click Tuner Rebuild -->
+      <button id="btnRebuild" class="btn primary" type="button">🔁 Rebuild Tuner</button>
+      <span id="rebStatus" class="status"></span>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for cat, msg in messages %}
+          <div class="flash">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    {% for it in pending %}
+      <div class="card">
+        <div class="ts">🕒 {{ it.timestamp }}</div>
+        <div class="h">Prompt</div>
+        <div class="mono">{{ it.prompt }}</div>
+
+        <div class="h">GPT Response (raw)</div>
+        <div class="mono">{{ it.response_raw }}</div>
+
+        <form method="post" action="{{ url_for('admin.admin_save') }}">
+          <input type="hidden" name="id" value="{{ it.id }}"/>
+          <div class="h">Edited Response (paste your rewrite here)</div>
+          <textarea name="edited" placeholder="Paste your rewrite here…" required></textarea>
+          <div class="row">
+            <button class="btn ok" type="submit">✅ Save & Add to Corpus</button>
+            <button class="btn bad" formaction="{{ url_for('admin.admin_reject') }}" formmethod="post">❌ Reject</button>
+          </div>
+        </form>
+      </div>
+    {% endfor %}
+
+    {% if not pending %}
+      <p class="mono">No pending items. Come back after the app logs new answers.</p>
+    {% endif %}
+
+    {% if approved %}
+      <h3 style="margin-top:28px">Previously Approved</h3>
+      {% for it in approved[:10] %}
+        <div class="card">
+          <div class="ts">🕒 {{ it.approved_at or it.timestamp }}</div>
+          <div class="h">Prompt</div>
+          <div class="mono">{{ it.prompt }}</div>
+          <div class="h">Edited Response</div>
+          <div class="mono">{{ it.edited_response }}</div>
+        </div>
+      {% endfor %}
+    {% endif %}
+  </div>
+
+  <script>
+    const btn = document.getElementById('btnRebuild');
+    const statusEl = document.getElementById('rebStatus');
+
+    async function rebuildTuner() {
+      try {
+        btn.disabled = true;
+        statusEl.textContent = 'Rebuilding…';
+        const res = await fetch('/tuner/rebuild', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data && (data.ok === true || !data.error)) {
+          statusEl.textContent = 'Done.';
+        } else {
+          statusEl.textContent = 'Error rebuilding.';
+        }
+      } catch (e) {
+        statusEl.textContent = 'Error rebuilding.';
+      } finally {
+        setTimeout(() => { statusEl.textContent = ''; btn.disabled = false; }, 4000);
+      }
+    }
+
+    btn.addEventListener('click', rebuildTuner);
+  </script>
+</body>
+</html>

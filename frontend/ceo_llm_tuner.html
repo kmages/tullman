@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tullman.ai — CEO LLM Tuner</title>
+<style>
+  :root { --bg:#0b0f17; --card:#121826; --line:#1f2a44; --text:#e8eefc; --muted:#8ea2c8; --accent:#4ea1ff; }
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:16px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  .wrap{max-width:900px;margin:40px auto;padding:0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  h1{margin:0 0 8px;font-size:22px}
+  label{display:block;color:var(--muted);margin:8px 0 6px}
+  input,textarea,select,button{font:inherit}
+  textarea{width:100%;min-height:120px;border:1px solid var(--line);border-radius:10px;background:#0f1627;color:var(--text);padding:10px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+  .row input[type="text"]{flex:1;min-width:240px;border:1px solid var(--line);border-radius:10px;background:#0f1627;color:var(--text);padding:10px}
+  .row select{border:1px solid var(--line);border-radius:10px;background:#0f1627;color:var(--text);padding:10px}
+  .btn{background:var(--accent);color:#00122a;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+  .btn[disabled]{opacity:.6;cursor:not-allowed}
+  #out{margin-top:14px}
+  #src{margin-top:10px;display:flex;flex-wrap:wrap;gap:8px}
+  .chip{padding:6px 10px;border-radius:999px;background:#10203a;border:1px solid var(--line);color:var(--muted)}
+  a{color:var(--accent);text-decoration:none}
+  pre{background:#0e1526;border:1px solid var(--line);border-radius:10px;padding:10px;overflow:auto}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+</style>
+
+  <link rel="icon" href="/assets/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16x16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png">
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>CEO LLM Tuner</h1>
+      <label for="p">Prompt</label>
+      <textarea id="p" placeholder="Ask anything…"></textarea>
+      <div class="row">
+        <label for="mode" style="margin:0;color:var(--muted)">Mode</label>
+        <select id="mode">
+          <option value="excerpt">Excerpt</option>
+          <option value="summary">Summary</option>
+        </select>
+        <button class="btn" id="run">Run</button>
+        <span id="status" class="chip" style="display:none"></span>
+      </div>
+      <div id="out"></div>
+      <div id="src"></div>
+    </div>
+  </div>
+
+<script>
+// --- tiny markdown renderer (headings, lists, links, bold/italic, code fences) ---
+const esc = s => (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function md(src=''){
+  let s = src.replace(/\r\n?/g,'\n');
+  s = s.replace(/```([\s\S]*?)```/g,(_,code)=>`<pre><code>${esc(code)}</code></pre>`);
+  s = s.replace(/^###### (.*)$/gm,'<h6>$1</h6>').replace(/^##### (.*)$/gm,'<h5>$1</h5>')
+       .replace(/^#### (.*)$/gm,'<h4>$1</h4>').replace(/^### (.*)$/gm,'<h3>$1</h3>')
+       .replace(/^## (.*)$/gm,'<h2>$1</h2>').replace(/^# (.*)$/gm,'<h1>$1</h1>');
+  s = s.replace(/^(?:-|\*) (.*)$/gm,'<li>$1</li>').replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>');
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a target="_blank" rel="noopener" href="$2">$1</a>');
+  s = s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>');
+  s = s.split(/\n{2,}/).map(b=>/^<h\d|^<ul>|^<pre>/.test(b.trim())?b:`<p>${b.replace(/\n/g,'<br>')}</p>`).join('\n');
+  return s;
+}
+const byId = id => document.getElementById(id);
+async function postAsk(prompt, mode){
+  const r = await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,mode})});
+  if(!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+byId('run').onclick = async () => {
+  const btn = byId('run'); const st = byId('status');
+  const prompt = byId('p').value.trim(); const mode = byId('mode').value;
+  if(!prompt){ byId('p').focus(); return; }
+  btn.disabled = true; st.style.display='inline-block'; st.textContent='Running…';
+  try{
+    const j = await postAsk(prompt, mode);
+    byId('out').innerHTML = md(j.answer||'');
+    byId('src').innerHTML = (j.sources||[]).map(s=>{
+      const label = [s.title||s.source_name||'', s.part||''].join(' ').trim();
+      return s.url ? `<span class="chip"><a href="${s.url}" target="_blank" rel="noopener">${esc(label||s.url)}</a></span>`
+                   : `<span class="chip">${esc(label)}</span>`;
+    }).join('');
+    st.textContent='Done';
+  }catch(e){
+    byId('out').textContent = 'Server error. Try again.'; st.textContent='Error';
+  }finally{
+    setTimeout(()=>{ st.style.display='none'; }, 1200);
+    btn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>

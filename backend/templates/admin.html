@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Admin — Tullman.ai</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    :root { --bg:#0b0b0c; --card:#141416; --ink:#e8e8ea; --muted:#a9abb3; --ok:#3ccf91; --bad:#ef476f; }
+    html,body{background:var(--bg);color:var(--ink);font:18px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+    .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+    .top{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+    .pill{padding:8px 12px;border-radius:999px;background:var(--card);border:1px solid #242428;color:var(--muted);font-size:15px}
+    .pill b{color:var(--ink)}
+    .btn{cursor:pointer;border-radius:12px;border:1px solid #2a2a31;background:#19191c;color:var(--ink);padding:10px 14px;font-weight:700}
+    .btn.ok{border-color:#1e644b;background:#0f3225}
+    .btn.bad{border-color:#612030;background:#2a121a}
+    .status{font-size:15px;color:var(--muted);margin-left:6px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .card{background:var(--card);border:1px solid #232329;border-radius:16px;padding:16px;margin:16px 0}
+    .lab{font-size:14px;color:#c9c9cf;margin:6px 0}
+    .h{font-weight:800;font-size:18px;margin-bottom:6px}
+    .mono{background:#0e0e10;border:1px solid #222229;border-radius:12px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
+    textarea{width:100%;min-height:220px;background:#0d0d0f;border:1px solid #222229;border-radius:12px;color:var(--ink);padding:12px;font:15px/1.4 ui-monospace,Menlo,Consolas,monospace}
+    form{margin:0}
+  .mono.path{display:block;max-width:100%;overflow:auto;word-break:break-all;white-space:normal;margin-top:6px;margin-bottom:6px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Admin — Tullman.ai</h2>
+
+    <div class="top">
+      <span class="pill">Pending: <b>{{ counts.pending }}</b></span>
+      <span class="pill">Approved: <b>{{ counts.approved }}</b></span>
+      <span class="pill">Rejected: <b>{{ counts.rejected }}</b></span>
+      <button id="btnRebuild" class="btn ok" type="button">🔁 Rebuild Tuner</button>
+      <button id="btnPromote" class="btn" type="button">⬆️ Promote to Production</button>
+      <span id="prodInfo" class="status">prod index: …</span>
+      <span id="rebStatus" class="status"></span>
+    </div>
+
+    <!-- RULES + EXAMPLES -->
+    <div class="grid">
+      <!-- Rules (Voiceprint) -->
+      <div class="card">
+        <div class="h">Rules (Voiceprint)</div>
+<div class="lab">Howard’s tone rules file:</div>
+<div class="mono path">/home/kmages/backend/voiceprint.txt</div>
+<textarea id="rulesBox" placeholder="Tone rules & guardrails…"></textarea>
+        <div style="margin-top:8px">
+          <button id="rulesSaveReplace" class="btn ok" type="button">Save (Replace)</button>
+          <button id="rulesSaveAppend"  class="btn"    type="button">Save (Append)</button>
+          <span id="rulesMsg" class="status"></span>
+          <div class="lab">Last saved: <span id="rulesTime" class="mono">(loading…)</span></div>
+        </div>
+      </div>
+
+      <!-- Examples (Q&A) -->
+      <div class="card">
+        <div class="h">Examples (Q&A)</div>
+<div class="lab">Howard’s Q&A examples file:</div>
+<div class="mono path">/home/kmages/backend/voiceprint_seed.jsonl</div>
+<textarea id="qaBox" placeholder="Q: …&#10;A: …&#10;&#10;Q: …&#10;A: …"></textarea>
+        <div style="margin-top:8px">
+          <button id="qaSave" class="btn ok" type="button">Save Q&A</button>
+          <span id="qaMsg" class="status"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Upload to Corpus -->
+    <div class="card">
+      <div class="h">Upload to Corpus</div>
+      <div class="lab">Add content into <span class="mono">/home/kmages/golden.jsonl</span>. Supports <b>.txt</b>, <b>.md</b>, <b>.jsonl</b>. (Others are saved to uploads only.)</div>
+      <input id="upFiles" type="file" multiple/>
+      <div style="margin-top:8px">
+        <button id="upBtn" class="btn ok" type="button">Upload</button>
+        <span id="upMsg" class="status"></span>
+      </div>
+    </div>
+
+    
+    <!-- Test & Tuning -->
+    <div class="card">
+      <div class="h">Test & Tuning</div>
+      <div class="lab">1) Ask a question</div>
+      <textarea id="ttPrompt" placeholder="Ask a question… (Enter to send)" style="min-height:90px"></textarea>
+      <div style="margin-top:8px">
+        <button id="ttAsk" class="btn ok" type="button">Ask</button>
+        <span id="ttMsg" class="status"></span>
+      </div>
+
+      <div class="lab" style="margin-top:12px">2) System answer (you can edit)</div>
+      <textarea id="ttAnswer" placeholder="Answer will appear here…" style="min-height:140px"></textarea>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">
+        <button id="ttAccept"   class="btn ok"  type="button">✅ Accept (save)</button>
+        <button id="ttEditSave" class="btn"     type="button">✍️ Edit & Save</button>
+        <button id="ttDiscard"  class="btn bad" type="button">🗑️ Discard</button>
+      </div>
+
+      <div class="lab" style="margin-top:16px">3) Add supporting content to corpus (optional)</div>
+      <input id="ttTag"  placeholder="Topic/Tag (optional)" style="width:100%;margin-bottom:6px"/>
+      <textarea id="ttSupport" placeholder="Paste supporting content to improve answers…" style="min-height:120px"></textarea>
+      <div style="margin-top:8px">
+        <button id="ttAddSupport" class="btn ok" type="button">➕ Add to Corpus</button>
+<button id="ttRebuildBelow" class="btn" type="button">🔁 Rebuild Tuner</button>
+      </div>
+    </div>
+    
+
+    <!-- Pending queue -->
+    {% for it in pending %}
+      <div class="card">
+        <div class="lab">🕒 {{ it.timestamp }}</div>
+        <div class="lab">Prompt</div>
+        <div class="mono">{{ it.prompt }}</div>
+
+        <!-- Raw vs Final side-by-side -->
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">
+          <div style="flex:1">
+            <div class="lab">Raw (GPT)</div>
+            <textarea readonly style="min-height:140px">{{ it.response_raw }}</textarea>
+          </div>
+          <div style="flex:1">
+            <form method="post" action="/admin/save">
+              <input type="hidden" name="id" value="{{ it.id }}"/>
+              <div class="lab">Final (Kenified) — edit before saving</div>
+              <textarea name="edited" style="min-height:140px"></textarea>
+              <div style="margin-top:8px">
+                <button class="btn ok" type="submit">✍️ Rewrite & Save</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <!-- Save raw / Discard -->
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">
+          <form method="post" action="/admin/save_raw">
+            <input type="hidden" name="id" value="{{ it.id }}"/>
+            <button class="btn ok" type="submit">✅ Save to Corpus (as-is)</button>
+          </form>
+          <form method="post" action="/admin/reject">
+            <input type="hidden" name="id" value="{{ it.id }}"/>
+            <button class="btn bad" type="submit">🗑️ Discard</button>
+          </form>
+        </div>
+      </div>
+    {% endfor %}
+    {% if not pending %}
+      <div class="card"><div class="mono">(No pending items.)</div></div>
+    {% endif %}
+  </div>
+
+<script>
+// Load Rules (voiceprint) and timestamp
+document.addEventListener('DOMContentLoaded', async () => {
+  try { const r=await fetch('/admin/api/voiceprint'); const j=await r.json(); document.getElementById('rulesBox').value = j.text || ''; }
+  catch{ document.getElementById('rulesBox').placeholder='(Could not load)'; }
+  try { const m=await fetch('/admin/api/voiceprint_meta'); const mj=await m.json(); document.getElementById('rulesTime').textContent = mj.mtime_iso || '(never)'; }
+  catch{ document.getElementById('rulesTime').textContent='(error)'; }
+  try { const q=await fetch('/admin/api/examples_text'); const qj=await q.json(); document.getElementById('qaBox').value = qj.text || ''; }
+  catch{ document.getElementById('qaBox').placeholder='(Could not load Q&A)'; }
+
+  // Fill Final (Kenified) from JSON if Raw holds {"raw":..., "final":...}
+  document.querySelectorAll('.card').forEach(card => {
+    const rawBox   = card.querySelector('textarea[readonly]');
+    const finalBox = card.querySelector('textarea[name="edited"]');
+    if (!rawBox || !finalBox) return;
+    const t = (rawBox.value || '').trim();
+    if (!t) return;
+    try {
+      const j = JSON.parse(t);
+      if (j && typeof j === 'object') {
+        if (j.raw)   rawBox.value   = String(j.raw);
+        if (j.final && !finalBox.value.trim()) finalBox.value = String(j.final);
+      }
+    } catch(_) { /* rawBox wasn't JSON; leave as-is */ }
+  });
+});
+
+// Save Rules (Replace/Append) → auto rebuild
+async function saveRules(mode){
+  const t=document.getElementById('rulesBox').value, msg=document.getElementById('rulesMsg');
+  try{
+    const fd=new FormData(); fd.append('text',t); fd.append('mode',mode);
+    const r=await fetch('/admin/api/voiceprint',{method:'POST',body:fd});
+    msg.textContent=r.ok?`Saved (${mode}).`:'Error.';
+    if (r.ok){ try{ await fetch('/tuner/rebuild',{method:'POST'}); }catch(e){} }
+    setTimeout(async ()=>{ try{ const m=await fetch('/admin/api/voiceprint_meta'); const mj=await m.json(); document.getElementById('rulesTime').textContent=mj.mtime_iso||'(never)'; }catch{} },300);
+  }catch{ msg.textContent='Error.' }
+  setTimeout(()=>msg.textContent='',3000);
+}
+document.getElementById('rulesSaveReplace').addEventListener('click',()=>saveRules('replace'));
+document.getElementById('rulesSaveAppend').addEventListener('click', ()=>saveRules('append'));
+
+// Save Q&A → auto rebuild
+document.getElementById('qaSave').addEventListener('click', async ()=>{
+  const t=document.getElementById('qaBox').value, msg=document.getElementById('qaMsg');
+  try{
+    const fd=new FormData(); fd.append('text',t);
+    const r=await fetch('/admin/api/examples_text',{method:'POST',body:fd});
+    msg.textContent=r.ok?'Saved.':'Error.';
+    if (r.ok){ try{ await fetch('/tuner/rebuild',{method:'POST'}); }catch(e){} }
+  }catch{ msg.textContent='Error.' }
+  setTimeout(()=>msg.textContent='',3000);
+});
+
+// Upload to Corpus
+document.getElementById('upBtn').addEventListener('click', async ()=>{
+  const fi=document.getElementById('upFiles'); const msg=document.getElementById('upMsg');
+  if(!fi.files.length){ msg.textContent='Pick files first.'; setTimeout(()=>msg.textContent='',3000); return; }
+  const fd=new FormData(); for(const f of fi.files) fd.append('files', f);
+  try{
+    const r=await fetch('/admin/api/upload',{method:'POST',body:fd});
+    msg.textContent=r.ok?'Uploaded and added to corpus.':'Upload failed.';
+  }catch(e){ msg.textContent='Upload error.' }
+  setTimeout(()=>msg.textContent='',4000);
+});
+
+// Manual rebuild button
+document.getElementById('btnRebuild').addEventListener('click', async ()=>{
+  const s=document.getElementById('rebStatus'); s.textContent='Rebuilding…';
+  try{ const r=await fetch('/tuner/rebuild',{method:'POST'}); s.textContent=r.ok?'Done.':'Error.'; }catch{ s.textContent='Error.' }
+  setTimeout(()=>s.textContent='',3000);
+});
+
+// Test & Tuning handlers
+(async function(){
+  const $ = sel => document.querySelector(sel);
+  const pEl = $('#ttPrompt'), aEl = $('#ttAnswer'), msg = $('#ttMsg');
+
+  async function ask() {
+    const q = (pEl.value||'').trim();
+    if(!q){ msg.textContent='Enter a question.'; setTimeout(()=>msg.textContent='',2500); return; }
+    msg.textContent = 'Thinking…';
+    try{
+      const r = await fetch('/retrieve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q})});
+      const j = await r.json();
+      aEl.value = (j && j.answer) ? j.answer : '(no answer)';
+      msg.textContent = 'Ready';
+    }catch(e){ msg.textContent='Error'; }
+    setTimeout(()=>msg.textContent='',2000);
+  }
+
+  async function saveAnswer(useEdited){
+    const q = (pEl.value||'').trim();
+    const ans = (aEl.value||'').trim();
+    if(!q || !ans){ msg.textContent='Nothing to save.'; setTimeout(()=>msg.textContent='',2000); return; }
+    try{
+      const fd = new FormData();
+      fd.append('title', q);
+      fd.append('text', ans);
+      const r = await fetch('/admin/api/index_text',{method:'POST',body:fd});
+      msg.textContent = r.ok ? 'Saved to corpus.' : 'Save failed.';
+      if(r.ok){ try{ await fetch('/tuner/rebuild',{method:'POST'}); }catch(e){} }
+    }catch(e){ msg.textContent='Save error.'; }
+    setTimeout(()=>msg.textContent='',2000);
+  }
+
+  $('#ttAsk')?.addEventListener('click', ask);
+  pEl?.addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); ask(); }});
+  $('#ttAccept')?.addEventListener('click', ()=>saveAnswer(false));
+  $('#ttEditSave')?.addEventListener('click', ()=>saveAnswer(true));
+  $('#ttDiscard')?.addEventListener('click', ()=>{ aEl.value=''; msg.textContent='Discarded (not saved).'; setTimeout(()=>msg.textContent='',1500); });
+
+  $('#ttAddSupport')?.addEventListener('click', async ()=>{
+    const tag = ($('#ttTag')?.value||'').trim() || '(admin note)';
+    const text = ($('#ttSupport')?.value||'').trim();
+    if(!text){ msg.textContent='Nothing to add.'; setTimeout(()=>msg.textContent='',2000); return; }
+    try{
+      const fd=new FormData(); fd.append('title',tag); fd.append('text',text);
+      const r = await fetch('/admin/api/index_text',{method:'POST',body:fd});
+      msg.textContent = r.ok ? 'Added to corpus.' : 'Add failed.';
+      if(r.ok){ try{ await fetch('/tuner/rebuild',{method:'POST'}); }catch(e){} }
+    }catch(e){ msg.textContent='Add error.'; }
+    setTimeout(()=>msg.textContent='',2000);
+  });
+})();
+
+
+// Prod index helpers (Promote + Count)
+async function refreshProdCount(){
+  try{
+    const r = await fetch('/semantic/reload',{method:'POST'});
+    const j = await r.json();
+    const el = document.getElementById('prodInfo');
+    if(el) el.textContent = (j && j.ok!==false && typeof j.prod_count==='number')
+      ? `prod index: ${j.prod_count}`
+      : 'prod index: ?';
+  }catch(e){
+    const el=document.getElementById('prodInfo'); if(el) el.textContent='prod index: ?';
+  }
+}
+document.addEventListener('DOMContentLoaded', refreshProdCount);
+
+document.getElementById('btnPromote')?.addEventListener('click', async ()=>{
+  const b = document.getElementById('btnPromote');
+  const s = document.getElementById('rebStatus');
+  if(b){ b.disabled = true; }
+  if(s){ s.textContent = 'Promoting…'; }
+  try{
+    const r = await fetch('/semantic/promote',{method:'POST'});
+    await refreshProdCount();
+    if(s){ s.textContent = r.ok ? 'Promoted.' : 'Promote failed.'; }
+  }catch(e){
+    if(s){ s.textContent = 'Promote error.'; }
+  }
+  setTimeout(()=>{ if(s) s.textContent=''; if(b) b.disabled=false; }, 2000);
+});
+
+
+// Rebuild tuner button in the Test & Tuning panel
+document.getElementById('ttRebuildBelow')?.addEventListener('click', async ()=>{
+  const msg=document.getElementById('ttMsg');
+  try{
+    const r=await fetch('/tuner/rebuild',{method:'POST'});
+    msg.textContent = r.ok ? 'Rebuilt.' : 'Rebuild failed.';
+  }catch(e){ msg.textContent='Rebuild error.'; }
+  setTimeout(()=>msg.textContent='',2000);
+});
+
+</script>
+</body>
+</html>
