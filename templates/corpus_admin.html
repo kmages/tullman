@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tullman.ai • Corpus Admin</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;color:#111}
+h1{margin:0 0 12px}
+.grid{display:grid;gap:16px;grid-template-columns:1fr}
+.sec{border:1px solid #e8e8e8;border-radius:12px;padding:12px}
+label{display:block;margin:6px 0 4px}
+input[type=text],textarea{width:100%;padding:10px;border:1px solid #ccc;border-radius:8px}
+button{padding:10px 14px;border:0;border-radius:8px;background:#0a7;color:#fff;cursor:pointer}
+.small{color:#666;font-size:.9rem}
+pre{background:#f7f7f9;padding:10px;border-radius:8px;overflow:auto}
+ul{margin:6px 0 0 18px}
+a{color:#2a7;text-decoration:none}a:hover{text-decoration:underline}
+</style>
+
+<h1>Corpus & Voice Admin</h1>
+<div class="grid">
+
+  <div class="sec">
+    <h3>Stats</h3>
+    <div class="small">raw_docs files: {{ info.files|length }}</div>
+    <div class="small">corpus lines: {{ info.corpus_lines }}</div>
+    <div class="small">voice seed lines: {{ info.voice_seed_lines }} • top10 lines: {{ info.voice_top_lines }}</div>
+    <div class="small" style="margin-top:8px">
+      <a href="/admin/download/corpus?token={{ token }}">Download corpus.jsonl</a> •
+      <a href="/admin/download/voice_seed?token={{ token }}">Download voice_seed.jsonl</a> •
+      <a href="/admin/download/voice_top?token={{ token }}">Download voice_top10.jsonl</a>
+    </div>
+  </div>
+
+  <div class="sec">
+    <h3>Upload file</h3>
+    <form method="post" action="/admin/corpus/upload?token={{ token }}" enctype="multipart/form-data">
+      <input type="file" name="file" required>
+      <div class="small">Allowed: .txt .md .html</div>
+      <button type="submit">Upload</button>
+    </form>
+  </div>
+
+  <div class="sec">
+    <h3>Paste text</h3>
+    <form method="post" action="/admin/corpus/paste?token={{ token }}">
+      <label>Filename</label>
+      <input type="text" name="filename" placeholder="my-note.txt">
+      <label>Text block</label>
+      <textarea name="text" rows="8" placeholder="Paste Howard’s content…"></textarea>
+      <button type="submit">Save</button>
+    </form>
+  </div>
+
+  <div class="sec">
+    <h3>Rebuild Corpus (JSONL)</h3>
+    <form method="post" action="/admin/corpus/rebuild?token={{ token }}">
+      <button type="submit">Rebuild</button>
+    </form>
+    <div class="small" style="margin-top:8px">
+      This scans <code>raw_docs/</code>, cleans & chunks, and writes <code>tullman_corpus.jsonl</code>.
+    </div>
+  </div>
+
+  <div class="sec">
+    <h3>Add Voice Sample</h3>
+    <form method="post" action="/admin/voice/add?token={{ token }}">
+      <label>Paste a strong Howard paragraph</label>
+      <textarea name="voice_text" rows="6" placeholder="Direct, pragmatic, punchy. No em dashes."></textarea>
+      <button type="submit">Append & Rebuild Voiceprint</button>
+    </form>
+    <div class="small" style="margin-top:8px">
+      Appends to <code>seed_input.txt</code>, then rebuilds <code>voiceprint_seed.jsonl</code> and Top 10 (if the scoring script is present).
+    </div>
+  </div>
+
+  <div class="sec">
+    <h3>raw_docs files</h3>
+    {% if info.files|length == 0 %}
+      <div class="small">No files yet.</div>
+    {% else %}
+      <ul>
+        {% for f in info.files %}
+          <li>{{ f }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  </div>
+
+  <div class="sec">
+    <h3>Sync to backend (manual)</h3>
+    <div class="small">Run these on your Chromebook to push JSONLs to the backend:</div>
+<pre>
+gcloud compute scp --project=tullman --zone=us-central1-a \
+  tullman-app:/home/kmages/tullman/tullman_corpus.jsonl \
+  jkg-prod:~/backend/tullman/
+
+gcloud compute scp --project=tullman --zone=us-central1-a \
+  tullman-app:/home/kmages/tullman/voiceprint_top10.jsonl \
+  jkg-prod:~/backend/tullman/
+</pre>
+  </div>
+
+</div>

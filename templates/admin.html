@@ -1,0 +1,36 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tullman.ai • Review Queue</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;color:#111}
+h1{margin:0 0 12px}.tabs a{margin-right:10px;text-decoration:none;padding:6px 10px;border-radius:8px;background:#f3f3f3;color:#111}
+.item{border:1px solid #e8e8e8;border-radius:12px;padding:12px;margin:14px 0}.row{display:grid;grid-template-columns:1fr;gap:8px}
+.q,.a{white-space:pre-wrap;padding:10px;border-radius:8px}.q{background:#fafafa}.a{background:#f2fbf6}
+textarea{width:100%;min-height:120px;padding:10px;border-radius:8px;border:1px solid #ccc}.btns{display:flex;gap:8px;flex-wrap:wrap}
+button{padding:8px 12px;border:0;border-radius:8px;background:#0a7;color:#fff;cursor:pointer}.secondary{background:#888}.meta{color:#666;font-size:.9rem}
+</style>
+<h1>Review Queue</h1>
+<div class="tabs">
+  <a href="?token={{ token }}&status=pending">Pending</a>
+  <a href="?token={{ token }}&status=approved">Approved</a>
+  <a href="?token={{ token }}&status=approved_edited">Approved (edited)</a>
+  <a href="?token={{ token }}&status=rejected">Rejected</a>
+  <a href="?token={{ token }}&status=all">All</a>
+</div>
+{% for it in items %}
+<div class="item">
+  <div class="meta">#{{ it.id }} • {{ it.ts }} • status: {{ it.status }}</div>
+  <div class="row">
+    <div class="q"><strong>Q:</strong> {{ it.question }}</div>
+    <div class="a"><strong>A:</strong> {{ it.answer }}</div>
+  </div>
+  <form class="row" method="post" action="/admin/save_edit/{{ it.id }}?token={{ token }}&status={{ status }}">
+    <label for="edited_{{ it.id }}"><strong>Edit answer (optional):</strong></label>
+    <textarea id="edited_{{ it.id }}" name="edited_answer">{{ it.edited_answer }}</textarea>
+    <div class="btns"><button type="submit">Save Edit + Approve</button></div>
+  </form>
+  <div class="btns" style="margin-top:8px;">
+    <form method="post" action="/admin/approve/{{ it.id }}?token={{ token }}&status={{ status }}"><button type="submit" class="secondary">Approve as-is</button></form>
+    <form method="post" action="/admin/reject/{{ it.id }}?token={{ token }}&status={{ status }}"><button type="submit" class="secondary" style="background:#c33">Reject</button></form>
+  </div>
+</div>
+{% endfor %}

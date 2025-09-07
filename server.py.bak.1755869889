@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+from flask import Flask, jsonify, request, send_from_directory
+from pathlib import Path
+import json, re, sqlite3, unicodedata, uuid
+from collections import deque, OrderedDict
+import requests
+from bs4 import BeautifulSoup
+
+# ---------- paths ----------
+BASE = Path.home() / "tullman"
+FRONTEND = BASE / "frontend"
+DATA = BASE / "data"
+CONTENT_JSONL = DATA / "content" / "content.jsonl"
+FTS_DB = DATA / "content" / "content.db"
+
+# ---------- app ----------
+app = Flask(__name__)
+
+# ---------- utils ----------
+def iter_jsonl(path: Path, limit: int | None = None) -> list[dict]:
+    if not path.exists(): return []
+    out=[]
+    with open(path,"r",encoding="utf-8") as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+                if limit and len(out)>=limit: break
+            except: pass
+    return out
+
+def normalize(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if ord(ch) < 0x0300).lower()
+
+def apply_tone_local(s: str) -> str:
+    s = re.sub(r"\b(might|maybe|perhaps|likely|it seems)\b","",s,flags=re.I)
+    s = s.replace("—","-")
+    return re.sub(r"\s{2,}"," ",s).strip()
+
+# ---------- FTS ----------
+def fts_available() -> bool: return FTS_DB.exists()
+
+def build_match(q: str) -> str:
+    qn=normalize(q); words=re.findall(r"[a-zA-Z]{3,}", qn); terms=[]
+    expand={"lycee":["lycee","lycée"], "francais":["francais","français"]}
+    for w in words: terms+=expand.get(w,[w])
+    terms=list(dict.fromkeys(terms))
+    return " OR ".join(terms) if terms else "*"
+
+def fts_query(q: str, k: int = 5) -> list[sqlite3.Row]:
+    con=sqlite3.connect(str(FTS_DB)); con.row_factory=sqlite3.Row
+    rows=con.execute("""SELECT title,source_name,source_type,part,text,bm25(content) AS score
+                        FROM content WHERE content MATCH ? ORDER BY score LIMIT ?""",
+                     (build_match(q), k*4)).fetchall()
+    con.close(); return rows
+
+def score_keywords(text: str, terms:set[str]) -> int:
+    t=(text or "").lower(); return sum(t.count(w) for w in terms if w)
+
+# ---------- coalescer ----------
+SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
+def chunk_index(part: str | None) -> int:
+    if not part: return 0
+    m=re.search(r'(\d+)$', part); return int(m.group(1)) if m else 0
+
+def coalesce_snippets(rows: list[dict], max_sent=12, max_chars=1400) -> tuple[str,list[dict]]:
+    if not rows: return "", []
+    same = len(rows)>=2 and all((r.get("source_name") or "").lower()==(rows[0].get("source_name") or "").lower() for r in rows)
+    ordered = sorted(rows, key=lambda r: chunk_index(r.get("part"))) if same else rows
+    out=[]; seen=set(); merged_low=""
+    for r in ordered:
+        txt=(r.get("text") or "").strip().replace("\n"," ")
+        for s in [re.sub(r"\s+"," ",x).strip() for x in SENT_SPLIT.split(txt)]:
+            if not s: continue
+            if not out and not re.match(r'^[\"“\(\'\[]?[A-Z0-9]', s): continue
+            key=s.lower()
+            if key in seen or (len(merged_low)>=50 and key in merged_low): continue
+            seen.add(key); out.append(s); merged_low=(merged_low+" "+key).strip()
+            if len(out)>=max_sent: break
+        if len(out)>=max_sent: break
+    merged=' '.join(out).strip()
+    if len(merged)>max_chars: merged=merged[:max_chars].rsplit(' ',1)[0].strip()
+    return merged, ordered
+
+# ---------- retrieval ----------
+def retrieve_from_corpus(q: str, want_k: int = 3) -> list[dict]:
+    rows=[]
+    if fts_available():
+        hits=fts_query(q, k=want_k)
+        qn=normalize(q); qwords=set(re.findall(r"[a-zA-Z]{3,}", qn))
+        ranked=[]
+        for r in hits:
+            title=normalize(r["title"]); sname=normalize(r["source_name"])
+            hit = any(w in title for w in qwords) or any(w in sname for w in qwords)
+            score=float(r["score"]) + (-2.0 if hit else 0.0)
+            ranked.append((score,r))
+        ranked.sort(key=lambda x:x[0])
+        for _,r in ranked[:want_k]:
+            rows.append({"title":r["title"],"source_name":r["source_name"],"part":r["part"],"text":r["text"]})
+    else:
+        items=iter_jsonl(CONTENT_JSONL, limit=20000)
+        qwords=set(re.findall(r"[a-zA-Z]{4,}", q.lower()))
+        hits=[]
+        for rec in items:
+            sc=score_keywords(rec.get("text",""), qwords)
+            if sc>0: hits.append((sc,rec))
+        hits.sort(key=lambda x:x[0], reverse=True)
+        for _,r in hits[:want_k]:
+            rows.append({"title":r.get("title"),"source_name":r.get("source_name"),"part":r.get("part"),"text":r.get("text")})
+    return rows
+
+# ---------- web fetch ----------
+SEARCH_DOMAINS_SAFE = ["howardtullman.com","inc.com","crainschicago.com","wikipedia.org","chicagotribune.com","chicagobusiness.com"]
+UA="Mozilla/5.0 (TullmanAI/1.0)"
+
+def search_duckduckgo(query: str, site: str|None=None, top:int=4)->list[dict]:
+    q = f"site:{site} {query}" if site else query
+    r = requests.post("https://duckduckgo.com/html/", data={"q":q}, headers={"User-Agent":UA}, timeout=8)
+    soup=BeautifulSoup(r.text,"lxml")
+    items=[]
+    for a in soup.select(".result__a")[:top]:
+        href=a.get("href"); txt=a.get_text(" ", strip=True)
+        if href and txt: items.append({"name":txt,"url":href})
+    return items
+
+def fetch_article(url:str, max_chars:int=6000)->str:
+    try:
+        r=requests.get(url, headers={"User-Agent":UA}, timeout=10)
+        r.raise_for_status()
+        soup=BeautifulSoup(r.text,"lxml")
+        for t in soup(["script","style","noscript"]): t.decompose()
+        return soup.get_text(" ", strip=True)[:max_chars]
+    except Exception:
+        return ""
+
+def weave_public_first(q:str)->tuple[str,list[dict]]:
+    # Tullman sites
+    texts=[]; srcs=[]
+    for site in ["howardtullman.com","inc.com"]:
+        for h in search_duckduckgo(q, site, top=4)[:3]:
+            u=h.get("url") or ""; 
+            if not u: continue
+            txt=fetch_article(u)
+            if len(txt)>=400: texts.append(txt[:3000]); srcs.append({"title":h.get("name"),"url":u})
+    if texts: return " ".join(texts)[:6000], srcs
+    # General web
+    texts=[]; srcs=[]
+    for h in search_duckduckgo(q, None, top=4)[:3]:
+        u=h.get("url") or ""; 
+        if not u: continue
+        txt=fetch_article(u)
+        if len(txt)>=400: texts.append(txt[:3000]); srcs.append({"title":h.get("name"),"url":u})
+    if texts: return " ".join(texts)[:6000], srcs
+    # Corpus fallback (sanitized)
+    rows = retrieve_from_corpus(q, want_k=3)
+    if rows:
+        excerpt,_ = coalesce_snippets(rows, max_sent=8, max_chars=900)
+        # strip email headers/addresses
+        excerpt = re.sub(r'(?im)^(from|to|cc|bcc|subject|date):.*$','', excerpt)
+        excerpt = re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b','[email]', excerpt)
+        return excerpt, []
+    return "", []
+
+# ---------- Kenifier (local tone only here; remote falls back automatically) ----------
+def kenify_markdown(prompt: str, woven_text: str, sources: list[dict]) -> str:
+    # Local fallback: first-person hint lives in prompt; produce simple markdown
+    body = woven_text
+    md = body if body.startswith("#") else f"# Answer\n\n{body}\n"
+    urls=[s for s in sources if s.get("url")]
+    if urls:
+        md += "\n\n## Sources\n" + "\n".join(f"- [{s.get('title') or s.get('url')}]({s.get('url')})" for s in urls)
+    return apply_tone_local(md)
+
+# ---------- simple sessions ----------
+SESSIONS: "OrderedDict[str, deque[tuple[str,str]]]" = OrderedDict()
+MAX_SESSIONS=200; MAX_TURNS=16
+def get_session(session_id:str|None):
+    sid = session_id or uuid.uuid4().hex
+    sess = SESSIONS.get(sid)
+    if sess is None:
+        sess = deque(maxlen=MAX_TURNS); SESSIONS[sid]=sess
+        if len(SESSIONS)>MAX_SESSIONS: SESSIONS.popitem(last=False)
+    else:
+        SESSIONS.move_to_end(sid)
+    return sid, sess
+
+# ---------- routes ----------
+@app.get("/")
+def home():
+    html = FRONTEND / "public.html"
+    if html.exists(): return send_from_directory(html.parent, html.name)
+    return jsonify({"ok": True, "msg": "Public page missing at ~/tullman/frontend/public.html"}), 200
+
+@app.get("/admin")
+def admin():
+    html = FRONTEND / "ceo_llm_tuner.html"
+    if html.exists(): return send_from_directory(html.parent, html.name)
+    return jsonify({"ok": False, "msg": "Admin page missing at ~/tullman/frontend/ceo_llm_tuner.html"}), 404
+
+@app.get("/health")
+def health():
+    items=iter_jsonl(CONTENT_JSONL, limit=20000)
+    counts={}; 
+    for x in items:
+        t=x.get("source_type","unknown"); counts[t]=counts.get(t,0)+1
+    return jsonify({"ok": True, "total": sum(counts.values()), "counts": counts, "fts": fts_available()})
+
+@app.get("/library")
+def library():
+    items=iter_jsonl(CONTENT_JSONL, limit=2000)
+    slim=[{"title":x.get("title"),"source_name":x.get("source_name"),
+           "source_type":x.get("source_type"),"part":x.get("part")} for x in items]
+    return jsonify({"total": len(items), "items": slim})
+
+@app.post("/ask")
+def ask():
+    j=request.get_json(force=True, silent=True) or {}
+    q=(j.get("prompt") or "").strip()
+    if not q: return jsonify({"answer":"Ask a question first.","sources":[]})
+    # corpus first, then web
+    rows=retrieve_from_corpus(q,want_k=3)
+    if rows:
+        excerpt,ordered=coalesce_snippets(rows, max_sent=12, max_chars=1400)
+        sources=[{"title":r["title"],"source_name":r["source_name"],"part":r["part"]} for r in ordered]
+    else:
+        text,srcs=weave_tull_json_first(q)
+        excerpt=text; sources=srcs
+    md = kenify_markdown(q + "\n\nSTYLE_HINT: Answer in the first person as Howard Tullman — 'I', 'my', 'me'.", excerpt, sources)
+    return jsonify({"answer": md, "sources": sources})
+
+@app.post("/chat")
+def chat():
+    j=request.get_json(force=True, silent=True) or {}
+    q=(j.get("prompt") or "").strip()
+    public=bool(j.get("public", True))
+    if not q: return jsonify({"session_id": j.get("session_id"), "answer":"Ask a question first.","sources":[]})
+    sid,hist=get_session(j.get("session_id"))
+    ctx=" ".join(f"{r}: {c}" for r,c in list(hist)[-8:])
+    if public:
+        text,srcs=weave_tull_json_first(f"{q}\n\nContext: {ctx}")
+    else:
+        text,srcs=weave_tull_json_first(f"{q}\n\nContext: {ctx}")  # reuse for now; admin can use /ask
+    md = kenify_markdown(q + "\n\nSTYLE_HINT: Answer in the first person as Howard Tullman — 'I', 'my', 'me'.", text, srcs)
+    hist.append(("user", q)); hist.append(("assistant", md))
+    if public: srcs=[s for s in srcs if s.get("url")]
+    return jsonify({"session_id": sid, "answer": md, "sources": srcs})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+
+# ---------- Tullman-only corpus helpers ----------
+def _is_tullman_record(rec: dict) -> bool:
+    name = (rec.get("source_name") or "").lower()
+    path = (rec.get("source_path") or "").lower()
+    text = (rec.get("text") or "").lower()
+    # Positive signals for Howard A. Tullman content
+    if "tullman" in name or "tullman" in path or "howard tullman" in text:
+        return True
+    if name.startswith("hat ") or " hat " in name:  # common HAT doc prefix
+        return True
+    # Exclude Ken/Just Ken or emaily items
+    if "gmail" in name or "gmail" in path or "my thoughts" in name:
+        return False
+    if "kmages" in text or "ken mages" in text:
+        return False
+    return False
+
+def weave_tull_json_first(q: str) -> tuple[str, list[dict]]:
+    """
+    Public flow: Tullman corpus first (filtered), then web.
+    Internal refs are NOT exposed for public; sources only have URLs if web.
+    """
+    rows = retrieve_from_corpus(q, want_k=5)
+    rows = [r for r in rows if _is_tullman_record(r)]
+    if rows:
+        excerpt, ordered = coalesce_snippets(rows, max_sent=10, max_chars=1200)
+        if excerpt:
+            return excerpt, []  # no internal refs in public replies
+    # fallback to public web
+    return weave_public_first(q)

@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+from flask import Flask, jsonify, request, send_from_directory, abort
+from pathlib import Path
+import json, re
+
+BASE = Path.home() / "tullman"
+FRONTEND = BASE / "frontend"
+DATA = BASE / "data"
+CONTENT_JSONL = DATA / "content" / "content.jsonl"
+
+app = Flask(__name__)
+
+def iter_jsonl(path: Path, limit: int | None = None):
+    if not path.exists(): return []
+    out=[]
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+                if limit and len(out) >= limit: break
+            except: pass
+    return out
+
+@app.get("/")
+def home():
+    html = FRONTEND / "ceo_llm_tuner.html"
+    if html.exists():
+        return send_from_directory(FRONTEND, html.name)
+    return "Tullman Tuner API is running. Upload ceo_llm_tuner.html to ~/tullman/frontend/", 200
+
+@app.get("/library")
+def library():
+    items = iter_jsonl(CONTENT_JSONL, limit=2000)
+    slim = [{
+        "title": x.get("title"),
+        "source_name": x.get("source_name"),
+        "source_type": x.get("source_type"),
+        "part": x.get("part"),
+    } for x in items]
+    return jsonify({"total": len(items), "items": slim})
+
+def score_keywords(text, terms):
+    t = (text or "").lower()
+    return sum(t.count(w) for w in terms if w)
+
+@app.post("/ask")
+def ask():
+    j = request.get_json(force=True, silent=True) or {}
+    q = (j.get("prompt") or "").strip()
+    if not q: return jsonify({"answer": "Ask a question first.", "sources": []})
+    terms = set(re.findall(r"[a-zA-Z]{4,}", q.lower()))
+    items = iter_jsonl(CONTENT_JSONL, limit=20000)
+    hits=[]
+    for rec in items:
+        sc = score_keywords(rec.get("text",""), terms)
+        if sc>0: hits.append((sc, rec))
+    hits.sort(key=lambda x:x[0], reverse=True)
+    top = [r for _, r in hits[:3]]
+    if not top:
+        return jsonify({"answer":"No matching content yet.", "sources":[]})
+    snippets=[]; sources=[]
+    for r in top:
+        txt = (r.get("text","") or "").strip().replace("\n"," ")
+        if txt: snippets.append(txt[:500])
+        sources.append({"title": r.get("title"), "source_name": r.get("source_name"), "part": r.get("part")})
+    # light tone pass
+    ans = " ".join(snippets)
+    ans = re.sub(r"\b(might|maybe|perhaps|it seems|likely)\b","",ans,flags=re.I)
+    ans = ans.replace("—","-")
+    ans = re.sub(r"\s{2,}"," ", ans).strip()
+    return jsonify({"answer": ans, "sources": sources})
+
+@app.get("/health")
+def health():
+    items = iter_jsonl(CONTENT_JSONL, limit=10000)
+    counts={}
+    for x in items:
+        t = x.get("source_type","unknown")
+        counts[t] = counts.get(t, 0) + 1
+    return jsonify({"ok": True, "total": len(items), "counts": counts})

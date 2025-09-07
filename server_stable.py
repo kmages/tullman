@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+from flask import Flask, jsonify, request, send_from_directory
+from pathlib import Path
+import os, json, re, sqlite3, unicodedata, uuid, logging
+from collections import deque, OrderedDict
+import requests
+from bs4 import BeautifulSoup
+
+# ----- paths -----
+BASE = Path.home() / "tullman"
+FRONTEND = BASE / "frontend"
+ASSETS   = FRONTEND / "assets"
+DATA = BASE / "data"
+CONTENT_JSONL = DATA / "content" / "content.jsonl"
+FTS_DB = DATA / "content" / "content.db"
+
+# ----- app -----
+app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
+
+# ----- utils -----
+def iter_jsonl(path: Path, limit: int | None = None) -> list[dict]:
+    if not path.exists(): return []
+    out=[]
+    with path.open("r", encoding="utf-8") as f:
+        for i,line in enumerate(f):
+            try:
+                out.append(json.loads(line))
+                if limit and len(out)>=limit: break
+            except Exception:
+                app.logger.warning("jsonl_parse_error", extra={"line":i})
+    return out
+
+def normalize(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if ord(ch) < 0x0300).lower()
+
+def apply_tone_local(s: str) -> str:
+    s = re.sub(r"\b(might|maybe|perhaps|likely|it seems)\b","",s,flags=re.I)
+    s = s.replace("—","-")
+    return re.sub(r"\s{2,}"," ",s).strip()
+
+# ----- FTS (optional, used if present) -----
+def fts_available() -> bool: return FTS_DB.exists()
+
+def build_match(q: str) -> str:
+    qn=normalize(q)
+    words=re.findall(r"[a-zA-Z]{3,}", qn)
+    expand={"lycee":["lycee","lycée"], "francais":["francais","français"]}
+    terms=[]
+    for w in words: terms += expand.get(w,[w])
+    terms=list(dict.fromkeys(terms))
+    return " OR ".join(terms) if terms else "*"
+
+def fts_query(q: str, k: int = 8) -> list[sqlite3.Row]:
+    con=sqlite3.connect(str(FTS_DB)); con.row_factory=sqlite3.Row
+    rows=con.execute("""SELECT title,source_name,source_type,part,text,bm25(content) AS score
+                        FROM content WHERE content MATCH ? ORDER BY score LIMIT ?""",
+                     (build_match(q), k*4)).fetchall()
+    con.close(); return rows
+
+# ----- coalescer -----
+SPLIT = re.compile(r'(?<=[.!?])\s+')
+def chunk_index(part: str | None) -> int:
+    if not part: return 0
+    m=re.search(r'(\d+)$', part); return int(m.group(1)) if m else 0
+
+def coalesce_snippets(rows: list[dict], max_sent=12, max_chars=1400) -> tuple[str,list[dict]]:
+    if not rows: return "", []
+    same = len(rows)>=2 and all((r.get("source_name") or "").lower()==(rows[0].get("source_name") or "").lower() for r in rows)
+    ordered = sorted(rows, key=lambda r: chunk_index(r.get("part"))) if same else rows
+    out=[]; seen=set(); merged_low=""
+    for r in ordered:
+        txt=(r.get("text") or "").strip().replace("\n"," ")
+        for s in [re.sub(r"\s+"," ",x).strip() for x in SPLIT.split(txt)]:
+            if not s: continue
+            if not out and not re.match(r'^[\"“\(\'\[]?[A-Z0-9]', s): continue
+            key=s.lower()
+            if key in seen or (len(merged_low)>=50 and key in merged_low): continue
+            seen.add(key); out.append(s); merged_low=(merged_low+" "+key).strip()
+            if len(out)>=max_sent: break
+        if len(out)>=max_sent: break
+    merged=' '.join(out).strip()
+    if len(merged)>max_chars: merged=merged[:max_chars].rsplit(' ',1)[0].strip()
+    return merged, ordered
+
+# ----- corpus retrieval (JSON-first) -----
+def retrieve_from_corpus(q: str, want_k: int = 12) -> list[dict]:
+    rows=[]
+    if fts_available():
+        hits=fts_query(q, k=want_k)
+        qn=normalize(q); qwords=set(re.findall(r"[a-zA-Z]{3,}", qn))
+        ranked=[]
+        for r in hits:
+            title=normalize(r["title"]); sname=normalize(r["source_name"])
+            hit = any(w in title for w in qwords) or any(w in sname for w in qwords)
+            score=float(r["score"]) + (-2.0 if hit else 0.0)
+            ranked.append((score,r))
+        ranked.sort(key=lambda x:x[0])
+        for _,r in ranked[:want_k]:
+            rows.append({"title":r["title"],"source_name":r["source_name"],"part":r["part"],"text":r["text"],"url":r.get("url")})
+    else:
+        items=iter_jsonl(CONTENT_JSONL, limit=25000)
+        qwords=set(re.findall(r"[a-zA-Z]{4,}", q.lower()))
+        hits=[]
+        for rec in items:
+            sc=sum((rec.get("text","") or "").lower().count(w) for w in qwords)
+            if sc>0: hits.append((sc,rec))
+        hits.sort(key=lambda x:x[0], reverse=True)
+        for _,r in hits[:want_k]:
+            rows.append({"title":r.get("title"),"source_name":r.get("source_name"),
+                         "part":r.get("part"),"text":r.get("text"),"url":r.get("url")})
+    return rows
+
+# ----- public filters (no Ken/JustKen/email) -----
+EMAILY_HDR = re.compile(r'(?im)^(from|to|cc|bcc|subject|date):.*$')
+EMAIL_ADDR = re.compile(r'\b[\w\.-]+@[\w\.-]+\.\w+\b')
+BAD_TERMS = ['gmail','my thoughts','kmages','ken mages','avatarbuddy','trincity','eyelevel','just ken','newsletter','on infinity']
+GOOD_HINTS= ['tullman','howard tullman','hat ',' 1871 ','kendall college','tribeca flashpoint','chicagoland entrepreneurial center']
+
+def looks_like_email(text: str) -> bool: return bool(EMAILY_HDR.search(text or ''))
+
+def is_public_tullman_ok(rec: dict) -> bool:
+    name=(rec.get('source_name') or '').lower()
+    text=(rec.get('text') or '').lower()
+    if looks_like_email(text): return False
+    if any(b in name or b in text for b in BAD_TERMS): return False
+    if any(g in name for g in GOOD_HINTS): return True
+    if any(g in text for g in GOOD_HINTS): return True
+    return False
+
+def sanitize_public_excerpt(s: str) -> str:
+    s = EMAILY_HDR.sub('', s or '')
+    s = EMAIL_ADDR.sub('[email]', s)
+    return re.sub(r'\s{2,}',' ', re.sub(r'\n{2,}','\n\n', s)).strip()
+
+# ----- web fetch (safe domains first) -----
+SAFE_DOMAINS = ["howardtullman.com","inc.com","wikipedia.org","crainschicago.com","chicagotribune.com","chicagobusiness.com"]
+UA="Mozilla/5.0 (TullmanAI/1.0)"
+
+def search_duckduckgo(query: str, site: str|None=None, top:int=4)->list[dict]:
+    q = f"site:{site} {query}" if site else query
+    r = requests.post("https://duckduckgo.com/html/", data={"q":q}, headers={"User-Agent":UA}, timeout=8)
+    soup=BeautifulSoup(r.text,"lxml")
+    items=[]
+    for a in soup.select(".result__a")[:top]:
+        href=a.get("href"); txt=a.get_text(" ", strip=True)
+        if href and txt: items.append({"name":txt,"url":href})
+    return items
+
+def fetch_article(url:str, max_chars:int=6000)->str:
+    try:
+        r=requests.get(url, headers={"User-Agent":UA}, timeout=10)
+        r.raise_for_status()
+        soup=BeautifulSoup(r.text,"lxml")
+        for t in soup(["script","style","noscript"]): t.decompose()
+        return soup.get_text(" ", strip=True)[:max_chars]
+    except Exception:
+        return ""
+
+def weave_public_first(q:str)->tuple[str,list[dict]]:
+    texts=[]; srcs=[]
+    for site in ["howardtullman.com","inc.com"]:
+        for h in search_duckduckgo(q, site, top=4)[:3]:
+            u=h.get("url") or ""
+            if not u: continue
+            txt=fetch_article(u)
+            if len(txt)>=400: texts.append(txt[:3000]); srcs.append({"title":h.get("name"),"url":u})
+    if texts: return " ".join(texts)[:6000], srcs
+    texts=[]; srcs=[]
+    for h in search_duckduckgo(q, None, top=4)[:3]:
+        u=h.get("url") or ""
+        if not u: continue
+        txt=fetch_article(u)
+        if len(txt)>=400: texts.append(txt[:3000]); srcs.append({"title":h.get("name"),"url":u})
+    if texts: return " ".join(texts)[:6000], srcs
+    return "", []
+
+def weave_tull_json_first(q: str) -> tuple[str, list[dict]]:
+    rows = [r for r in retrieve_from_corpus(q, want_k=12) if is_public_tullman_ok(r)]
+    if rows:
+        excerpt,_ = coalesce_snippets(rows, max_sent=10, max_chars=1200)
+        excerpt = sanitize_public_excerpt(excerpt)
+        if excerpt: return excerpt, []
+    return weave_public_first(q)
+
+# ----- GPT-5 (always) + first-person -----
+def curated_first_person(prompt: str, woven_text: str) -> str:
+    p=(prompt or "").lower()
+    if "who is" in p or "about" in p:
+        return ("Hi — I’m Howard Tullman. I’m a Chicago-based entrepreneur, operator, and investor. "
+                "I led 1871, helped build Tribeca Flashpoint Academy, and turned around Kendall College. "
+                "Earlier I founded or ran CCC Information Services, Tunes.com, and The Cobalt Group. "
+                "I mentor founders, invest in scrappy teams, and I’m direct and practical about execution. "
+                "I believe AI is now table stakes for every business and for individuals, so I push teams to run small, smart experiments and ship real results.")
+    return woven_text or ""
+
+def kenify_markdown(prompt: str, woven_text: str, sources: list[dict]) -> str:
+    """ALWAYS use GPT-5 if key present; fallback to curated first-person."""
+    import openai
+    model = os.getenv("OPENAI_MODEL", "gpt-5-thinking")
+    key = os.getenv("OPENAI_API_KEY","")
+    if key:
+        try:
+            openai.api_key = key
+            sysmsg = ("You are Howard Tullman. Speak in first person (I, my). "
+                      "Be warm, candid, direct, optimistic, and concise. "
+                      "Return clean Markdown. Do not add a heading like '# Answer'.")
+            user = f"{prompt}\n\nCONTENT:\n{woven_text}"
+            app.logger.info(f"kenifier model={model} remote=True")
+            resp = openai.ChatCompletion.create(
+                model=model,
+                messages=[{"role":"system","content":sysmsg},
+                          {"role":"user","content":user}],
+                temperature=0.2,
+            )
+            body = resp["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            app.logger.warning(f"kenifier remote failed: {e}")
+            body = curated_first_person(prompt, woven_text)
+    else:
+        body = curated_first_person(prompt, woven_text)
+
+    md = body
+    urls=[s for s in sources if s.get("url")]
+    if not urls and "howard tullman" in (prompt or "").lower():
+        urls=[{"title":"Wikipedia: Howard Tullman","url":"https://en.wikipedia.org/wiki/Howard_Tullman"}]
+    if urls:
+        md += "\n\n## Sources\n" + "\n".join(f"- [{s.get('title') or s.get('url')}]({s.get('url')})" for s in urls)
+    return apply_tone_local(md)
+
+# ----- sessions -----
+SESSIONS: "OrderedDict[str, deque[tuple[str,str]]]" = OrderedDict()
+MAX_SESSIONS=200; MAX_TURNS=16
+def get_session(session_id:str|None):
+    sid = session_id or uuid.uuid4().hex
+    sess = SESSIONS.get(sid)
+    if sess is None:
+        sess = deque(maxlen=MAX_TURNS); SESSIONS[sid]=sess
+        if len(SESSIONS)>MAX_SESSIONS: SESSIONS.popitem(last=False)
+    else:
+        SESSIONS.move_to_end(sid)
+    return sid, sess
+
+# ----- routes -----
+@app.get("/health")
+def health():
+    items=iter_jsonl(CONTENT_JSONL, limit=20000)
+    counts={}
+    for x in items:
+        t=x.get("source_type","unknown"); counts[t]=counts.get(t,0)+1
+    return jsonify({"ok": True, "total": sum(counts.values()), "counts": counts, "fts": fts_available()})
+
+@app.get("/")
+def home():
+    html = FRONTEND / "public.html"
+    if html.exists(): return send_from_directory(html.parent, html.name)
+    return jsonify({"ok": True, "msg": "Public page missing at ~/tullman/frontend/public.html"}), 200
+
+@app.get("/admin")
+def admin():
+    html = FRONTEND / "ceo_llm_tuner.html"
+    if html.exists(): return send_from_directory(html.parent, html.name)
+    return jsonify({"ok": False, "msg": "Admin page missing at ~/tullman/frontend/ceo_llm_tuner.html"}), 404
+
+@app.get("/assets/<path:fname>")
+def assets(fname):
+    return send_from_directory(ASSETS, fname)
+
+@app.post("/ask")
+def ask():
+    j=request.get_json(force=True, silent=True) or {}
+    q=(j.get("prompt") or "").strip()
+    if not q: return jsonify({"answer":"Ask a question first.","sources":[]})
+    rows=[r for r in retrieve_from_corpus(q,want_k=8)]
+    if rows:
+        excerpt,ordered=coalesce_snippets(rows, max_sent=12, max_chars=1400)
+        sources=[{"title":r["title"],"source_name":r["source_name"],"part":r["part"],"url":r.get("url")} for r in ordered]
+    else:
+        text,srcs=weave_public_first(q); excerpt=text; sources=srcs
+    md = kenify_markdown(q, excerpt, sources)
+    return jsonify({"answer": md, "sources": [s for s in sources if s.get("url")]})
+
+@app.post("/chat")
+def chat():
+    j=request.get_json(force=True, silent=True) or {}
+    q=(j.get("prompt") or "").strip()
+    public=bool(j.get("public", True))
+    if not q: return jsonify({"session_id": j.get("session_id"), "answer":"Ask a question first.","sources":[]})
+    sid,hist=get_session(j.get("session_id"))
+    ctx=" ".join(f"{r}: {c}" for r,c in list(hist)[-8:])
+    if public:
+        text,srcs=weave_tull_json_first(f"{q}\n\nContext: {ctx}")
+        persona = ("You are Howard Tullman. Speak in first person (I, my). "
+                   "Be warm, candid, direct, and optimistic. You believe AI is critical for every business and individual. "
+                   "STYLE_HINT: first person.")
+        md = kenify_markdown(persona + "\n\nUSER_PROMPT:\n" + q, text, srcs)
+        srcs=[s for s in srcs if s.get("url")]
+    else:
+        text,srcs=weave_public_first(f"{q}\n\nContext: {ctx}")
+        md = kenify_markdown(q, text, srcs)
+    hist.append(("user", q)); hist.append(("assistant", md))
+    return jsonify({"session_id": sid, "answer": md, "sources": srcs})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

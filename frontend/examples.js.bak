@@ -1,0 +1,154 @@
+import { refreshCounters, withSpinner } from '/frontend/public_extras.js';
+
+const API_BASE = location.origin.replace(/:\d+$/, '') + ':5057';
+const toast = document.querySelector('[data-toast]');
+const list = document.querySelector('#examplesList');
+
+function showToast(text, ms = 1500) {
+  if (!toast) return;
+  toast.textContent = text;
+  setTimeout(()=>toast.textContent='', ms);
+}
+
+async function api(path, opts={}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(()=>res.statusText);
+    throw new Error(`${res.status} ${res.statusText} – ${t}`);
+  }
+  return res.json();
+}
+
+function pill(text, cls='') {
+  const span = document.createElement('span');
+  span.className = `pill ${cls}`;
+  span.textContent = text;
+  return span;
+}
+
+function rowInput(label, value, multiline=false) {
+  const wrap = document.createElement('div');
+  const lab = document.createElement('label');
+  lab.textContent = label;
+  const input = multiline ? document.createElement('textarea') : document.createElement('input');
+  if (!multiline) input.type = 'text';
+  input.value = value || '';
+  input.style.width = '100%';
+  input.style.padding = '8px';
+  input.style.border = '1px solid #ccc';
+  input.style.borderRadius = '8px';
+  wrap.append(lab, input);
+  return { wrap, input };
+}
+
+function renderExampleCard(ex) {
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  const top = document.createElement('div');
+  top.style.display = 'flex';
+  top.style.alignItems = 'center';
+  top.style.justifyContent = 'space-between';
+  const left = document.createElement('div');
+  left.append(
+    pill(`ID ${ex.id}`),
+    pill(ex.locked ? 'locked' : 'unlocked', ex.locked ? 'locked' : ''),
+    pill(ex.active ? 'active' : 'inactive', ex.active ? 'active' : 'inactive'),
+  );
+  const right = document.createElement('div');
+  top.append(left, right);
+  card.appendChild(top);
+
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+  grid.style.marginTop = '10px';
+
+  const r1 = document.createElement('div'); r1.className = 'row';
+  const q1 = rowInput('Primary Question', ex.primary_question);
+  const a1 = rowInput('Canonical Answer (served as-is; excluded from Log)', ex.answer, true);
+  r1.append(q1.wrap, a1.wrap);
+
+  const r2 = document.createElement('div'); r2.className = 'row';
+  const aliasStr = (ex.aliases || []).join(', ');
+  const al = rowInput('Aliases (comma-separated)', aliasStr);
+  const lbl = rowInput('Label (optional)', ex.label || '');
+  r2.append(al.wrap, lbl.wrap);
+
+  grid.append(r1, r2);
+  card.appendChild(grid);
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  actions.style.marginTop = '8px';
+
+  const btnSave   = document.createElement('button'); btnSave.textContent   = 'Save';
+  const btnToggle = document.createElement('button'); btnToggle.textContent = ex.active ? 'Deactivate' : 'Activate';
+  const btnLock   = document.createElement('button'); btnLock.textContent   = ex.locked ? 'Unlock' : 'Lock';
+  actions.append(btnSave, btnToggle, btnLock);
+  card.appendChild(actions);
+
+  btnSave.addEventListener('click', withSpinner(btnSave, async () => {
+    const payload = {
+      primary_question: q1.input.value.trim(),
+      answer: a1.input.value,
+      aliases: al.input.value.split(',').map(s=>s.trim()).filter(Boolean),
+      label: lbl.input.value.trim(),
+    };
+    const r = await api(`/api/examples/${ex.id}`, { method:'PATCH', body: JSON.stringify(payload) });
+    showToast('Saved.');
+    await load(); // re-render
+  }));
+
+  btnToggle.addEventListener('click', withSpinner(btnToggle, async () => {
+    const r = await api(`/api/examples/${ex.id}`, { method:'PATCH', body: JSON.stringify({ active: !ex.active }) });
+    showToast(r.example.active ? 'Activated' : 'Deactivated');
+    await load();
+  }));
+
+  btnLock.addEventListener('click', withSpinner(btnLock, async () => {
+    const r = await api(`/api/examples/${ex.id}`, { method:'PATCH', body: JSON.stringify({ locked: !ex.locked }) });
+    showToast(r.example.locked ? 'Locked' : 'Unlocked');
+    await load();
+  }));
+
+  return card;
+}
+
+async function load() {
+  await refreshCounters();
+  const data = await api('/api/examples');
+  list.innerHTML = '';
+  data.items.forEach(ex => list.appendChild(renderExampleCard(ex)));
+}
+
+// Create new
+const btnCreate = document.querySelector('#btnCreate');
+const newQ = document.querySelector('#newQ');
+const newA = document.querySelector('#newA');
+const newAliases = document.querySelector('#newAliases');
+
+btnCreate.addEventListener('click', withSpinner(btnCreate, async () => {
+  const pq = (newQ.value || '').trim();
+  const ans = (newA.value || '').trim();
+  const aliases = (newAliases.value || '').split(',').map(s=>s.trim()).filter(Boolean);
+  if (!pq || !ans) {
+    showToast('Primary Question and Answer are required.', 1800);
+    return;
+  }
+  await api('/api/examples', { method:'POST', body: JSON.stringify({
+    primary_question: pq,
+    answer: ans,
+    aliases,
+    active: true,
+    locked: true
+  })});
+  newQ.value = ''; newA.value = ''; newAliases.value = '';
+  showToast('Example created (locked & active).');
+  await load();
+}));
+
+document.querySelector('#btnTop').addEventListener('click', ()=>window.scrollTo({top:0, behavior:'smooth'}));
+document.addEventListener('DOMContentLoaded', load);

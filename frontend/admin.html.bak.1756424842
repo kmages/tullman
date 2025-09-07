@@ -1,0 +1,116 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta http-equiv="Cache-Control" content="no-store"/>
+<title>Admin — Tullman.ai</title>
+<style>
+:root{--bg:#0b0b0c;--ink:#e8e8ea;--muted:#a9abb3;--card:#141416;--line:#232329;--ok:#3ccf91;--bad:#ef476f}
+html,body{background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:0}
+.wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+.h{font-weight:800;font-size:20px;margin:10px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin:16px 0}
+.lab{color:var(--muted);font-size:14px;margin:6px 0}
+textarea,input[type=text]{width:100%;background:#0d0d0f;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px;font:15px/1.4 ui-monospace,Menlo,Consolas,monospace}
+.btn{display:inline-block;cursor:pointer;border-radius:12px;border:1px solid #2a2a31;background:#19191c;color:var(--ink);padding:10px 14px;font-weight:700;margin-right:8px}
+.btn.ok{border-color:#1e644b;background:#0f3225}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.status{color:var(--muted);font-size:14px;margin-left:8px}
+.mono{white-space:pre-wrap;background:#0d0d0f;border:1px solid var(--line);border-radius:10px;padding:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Admin — Tullman.ai</h2>
+  <div class="row">
+    <a href="/assets/loop.html" class="btn ok" style="text-decoration:none">Open Loop Test ▶</a>
+    <span id="status" class="status">BUILD: 1756416478</span>
+  </div>
+
+  <div class="grid">
+    <!-- Rules (Voiceprint) -->
+    <div class="card">
+      <div class="h">Rules (Voiceprint)</div>
+      <div class="lab">Edit staging rules. Promote when ready.</div>
+      <textarea id="vpText" rows="12" placeholder="Voiceprint…">QUESTION BANK (examples of audience asks - read for context; do not quote):
+- Q: What is the most underrated human quality and why?
+- Q: Hard truth about your life that you have accepted?
+- Q: What does forgiveness do for you?
+- Q: When did you realize you had free will?
+- Q: Have you ever walked away from a comfortable corporate job?
+- Q: How do you get unstuck when your mind is stuck?
+- Q: What do mirrors teach you about how you see yourself versus how others see you?
+- Q: What makes something unforgettable?
+- Q: Why do some people cry when they're happy?
+- Q: What is real imagination, and how is it different from just appreciating what's happening?
+- Q: Who do you think has demonstrated imagination the most?
+- Q: What is the difference between love and attraction?
+- Q: Why can't AI be genuinely funny yet?
+- Q: Do humans truly have free will, or are we just reacting?
+- Q: Have you ever had a near-death experience that changed your fear of dying?
+- Q: Why do we dream, and what do dreams do for us?
+- Q: What do you wish you had known at 20 about health, time, and resilience?
+- Q: Is consistency overrated if it means being reliably average?
+- Q: What is the best kind of feedback, and why is committed disagreement gold?
+- Q: How do you define success without making it about money?
+- Q: Why doesn't time scale?
+- Q: What advice would you give a driven 12-year-old about ambition and work?
+- Q: What's the real gap between IQ and EQ that smart people miss?
+- Q: What is the difference between loyalty and reliability?
+- Q: What single trait defines you at your core?
+- Q: What do people get wrong about kindness, and why does it matter?
+- Q: What's one irrational belief you keep because it helps you move forward?
+- Q: What is the meaning of life?</textarea>
+      <div class="row">
+        <button id="vpLoad" class="btn">Load</button>
+        <button id="vpSave" class="btn ok">Save (Replace)</button>
+        <button id="vpAppend" class="btn">Save (Append)</button>
+      </div>
+      <div class="lab">Path: <span class="status mono">/home/kmages/backend/voiceprint_staging.txt</span></div>
+    </div>
+
+    <!-- Examples (Q&A) -->
+    <div class="card">
+      <div class="h">Examples (Q&A)</div>
+      <div class="lab">Blocks of <b>Q:</b> then <b>A:</b> ; blank line between.</div>
+      <textarea id="qaBox" rows="26" spellcheck="false">Q: What is the meaning of life?
+A: I am not a rabbi, priest or philosopher and I'm also in a hurry so questions like this are not a good use of my time or yours.</textarea>
+      <div class="row">
+        <button id="qaSave" class="btn ok">Save Q&A</button>
+        <button id="qaRestore" class="btn">↩ Restore from Prod Index</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="h">Rebuild Tuner</div>
+    <button id="rebuild" class="btn ok">Rebuild Tuner</button>
+    <pre id="rebuildLog" class="mono"></pre>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const note=t=>{const el=; if(el){ el.textContent=t; setTimeout(()=>el.textContent="",1500);} };
+const postForm=(url, fields)=>{const fd=new FormData(); Object.entries(fields).forEach(([k,v])=>fd.append(k,v)); return fetch(url,{method:"POST",body:fd});};
+// sanitize any mojibake from APIs
+const clean=s=>(s||"").replace(/â€™|â€˜|â/g,"'").replace(/[\u2018\u2019]/g,"'")
+                     .replace(/â€œ|â€\x9d/g,'"').replace(/[\u201C\u201D]/g,'"')
+                     .replace(/â€“|â€”/g,"-").replace(/[\u2013\u2014]/g,"-").replace(/Â/g,"");
+
+.onclick = async()=>{ try{ const r=await fetch("/admin/api/voiceprint"); const j=await r.json(); .value=(j.text||""); note("Loaded"); }catch{ note("Load error"); }};
+.onclick = async()=>{ try{ await postForm("/admin/api/voiceprint",{text:.value||""}); note("Saved"); }catch{ note("Save error"); }};
+.onclick = async()=>{ try{ await postForm("/admin/api/voiceprint",{text:.value||"",mode:"append"}); note("Appended"); }catch{ note("Append error"); }};
+
+.onclick = async()=>{ try{ await postForm("/admin/api/examples_text",{text:.value||""}); note("Q&A saved"); }catch{ note("Save failed"); }};
+.onclick = async()=>{ try{
+    const r=await fetch("/admin/api/examples_restore_from_prod",{method:"POST"}); if(!r.ok){ note("Restore failed"); return; }
+    const t=await fetch("/admin/api/examples_text"); const j=await t.json();
+    .value = clean(j.text||""); note("Restored");
+  }catch{ note("Restore error"); }};
+
+.onclick = async()=>{ try{
+    note("Rebuilding…"); const r=await fetch("/tuner/rebuild",{method:"POST"}); const j=await r.json().catch(()=>({log:""}));
+    .textContent=j.log||"(done)"; note("Done");
+  }catch{ note("Rebuild error"); }};
+</script>
+</body></html>

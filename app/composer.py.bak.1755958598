@@ -1,0 +1,488 @@
+from pathlib import Path
+
+import json
+import re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from collections import OrderedDict
+import os, re, json, unicodedata, requests, logging
+from bs4 import BeautifulSoup
+BASE= Path.home() / "tullman"
+DATA     = BASE / "data"
+CONTENT  = DATA / "content" / "content.jsonl"
+UA       = "Mozilla/5.0 (TullmanAI/1.0)"
+WIKI_URL = "https://en.wikipedia.org/wiki/Howard_A._Tullman"
+
+# Public JSON filter: exclude email/"Just Ken"/ceremony/speech content
+BAD_TERMS  = {
+  'gmail','my thoughts','kmages','ken mages','avatarbuddy','trincity','eyelevel','just ken','newsletter','on infinity',
+  'graduation','commencement','committee','illinois tech','illinois institute of technology','ceremony','speech',
+  'i want to thank','honored to','team at 1871','board','applause','faculty and staff'
+}
+GOOD_HINTS = {
+  'tullman','howard tullman','hat ',' 1871 ','kendall college','tribeca flashpoint','chicagoland entrepreneurial center',
+  'ccc information services','tunes.com','cobalt'
+}
+
+# Public links should come from Howard's properties or solid bios
+SAFE_DOMAINS = ('howardtullman.com','tullman.blogspot.com','blogspot.com','inc.com','northwestern.edu','wikipedia.org',
+                'crainschicago.com','chicagobusiness.com')
+
+def _norm(s:str)->str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if ord(ch) < 0x0300).lower()
+
+def _looks_email(t:str)->bool:
+    return bool(re.search(r'(?im)^(from|to|cc|bcc|subject|date):', t or ""))
+
+def _is_bio_prompt(prompt:str)->bool:
+    q=(prompt or '').lower()
+    return any(k in q for k in ('who is','about','bio','profile','background'))
+
+def _is_strategy_prompt(prompt:str)->bool:
+    q=(prompt or '').lower()
+    return ('ai' in q and 'strategy' in q) or 'need an ai' in q or 'ai plan' in q
+
+def _load_corpus(limit:int|None=None)->list[dict]:
+    out=[]
+    if not CONTENT.exists(): return out
+    with open(CONTENT,"r",encoding="utf-8") as f:
+        for i,line in enumerate(f):
+            try:
+                out.append(json.loads(line))
+                if limit and len(out)>=limit: break
+            except: pass
+    return out
+
+def _domain_ok(u:str)->bool:
+    try:
+        host = re.sub(r'^https?://','',u).split('/')[0].lower()
+        return any(host.endswith(d) for d in SAFE_DOMAINS)
+    except: return False
+
+def _ok_public(rec:dict)->bool:
+    name=_norm(rec.get("source_name"))
+    text=_norm(rec.get("text"))
+    if _looks_email(rec.get("text","")): return False
+    if any(b in name or b in text for b in BAD_TERMS): return False
+    if any(g in name for g in GOOD_HINTS): return True
+    if any(g in text for g in GOOD_HINTS): return True
+    return False
+
+def _clean_title(t:str|None)->str:
+    if not t: return "Source"
+    t = re.sub(r'\s*-\s*chunk\s*\d+\s*$','', t, flags=re.I)
+    t = re.sub(r'\s*chunk\s*\d+\s*$','', t, flags=re.I).strip()
+    if t and t.upper()==t: t = t.title()
+    return t or "Source"
+
+def _select_chunks(prompt:str, public:bool, k:int=8)->tuple[list[dict],list[dict]]:
+    rows=_load_corpus(limit=80000)
+    q=_norm(prompt); terms=set(re.findall(r"[a-zA-Z]{3,}", q))
+    scored=[]
+    for r in rows:
+        if public and not _ok_public(r): continue
+        txt=(r.get("text") or ""); low=txt.lower()
+        boost=5 if ("tullman" in ((r.get("source_name") or "") + " " + low)) else 0
+        sc=boost + sum(low.count(t) for t in terms)
+        if sc>0: scored.append((sc, r))
+    scored.sort(key=lambda x:x[0], reverse=True)
+    top=[r for _,r in scored[:k]]
+
+    url_sources=[]; seen=set()
+    for r in top:
+        u=r.get("url") or ""
+        if public and u and not _domain_ok(u):  # public chips only from safe domains
+            continue
+        if u and u not in seen:
+            url_sources.append({"title":_clean_title(r.get("title") or r.get("source_name") or u), "url":u})
+            seen.add(u)
+    return top, url_sources
+
+def _facts_from(chunks:list[dict], max_facts:int=8)->str:
+    facts=[]; seen=set()
+    for r in chunks:
+        t=(r.get("text") or "")
+        for s in re.split(r'(?<=[.!?])\s+', t)[:2]:
+            s=s.strip()
+            if not s: continue
+            low=s.lower()
+            if low.startswith(("by ","photo:","copyright")): continue
+            if any(b in low for b in BAD_TERMS): continue
+            if s in seen: continue
+            seen.add(s); facts.append(f"- {s}")
+            if len(facts)>=max_facts: break
+        if len(facts)>=max_facts: break
+    return "\n".join(facts)
+
+# --- simple web fallback (Howard's properties favored) ---
+def _search_web(query:str, site:str|None=None, top:int=4)->list[dict]:
+    q = f"site:{site} {query}" if site else query
+    r = requests.post("https://duckduckgo.com/html/", data={"q":q}, headers={"User-Agent":UA}, timeout=8)
+    soup=BeautifulSoup(r.text,"lxml")
+    items=[]
+    for a in soup.select(".result__a")[:top]:
+        href=a.get("href"); txt=a.get_text(" ", strip=True)
+        if href and txt: items.append({"name":txt, "url":href})
+    return items
+
+def _fetch(url:str, max_chars:int=6000)->str:
+    try:
+        r=requests.get(url, headers={"User-Agent":UA}, timeout=10); r.raise_for_status()
+        soup=BeautifulSoup(r.text,"lxml")
+        for t in soup(["script","style","noscript"]): t.decompose()
+        return soup.get_text(" ", strip=True)[:max_chars]
+    except: return ""
+
+def _web_fallback(prompt:str)->tuple[str,list[dict]]:
+    texts=[]; srcs=[]
+    for site in ("howardtullman.com","tullman.blogspot.com","inc.com","northwestern.edu","wikipedia.org"):
+        for h in _search_web(prompt, site, top=4)[:2]:
+            u=h.get("url") or ""
+            if not u or not _domain_ok(u): continue
+            txt=_fetch(u)
+            if len(txt)>=400: texts.append(txt[:3000]); srcs.append({"title":_clean_title(h.get("name")), "url":u})
+    if texts: return " ".join(texts)[:6000], srcs
+    return "", []
+
+# --- GPT rewrite (model chain) + curated fallbacks + post-polish ---
+_log = logging.getLogger("kenifier")
+
+def _quality_gate(md:str)->bool:
+    bad = [
+        re.search(r'(?i)#\s*answer', md),
+        re.search(r'\bI\s+takes\b|\bI\s+has\b|\bI\s+does\b', md),
+        re.search(r'(?i)\bHoward\s+Tullman\b.*\bI\b|\bI\b.*\bHoward\s+Tullman\b', md),
+    ]
+    return not any(bad)
+
+def _fix_phrasing(md:str)->str:
+    return md.replace("founded or ran", "founded and ran")
+
+def _curated_fallback(prompt:str)->str:
+    p=_norm(prompt)
+    if _is_bio_prompt(prompt):
+        return _fix_phrasing(
+            "Hi - I'm Howard Tullman. I'm a Chicago-based entrepreneur, operator, investor, and art collector. "
+            "I led 1871, helped build Tribeca Flashpoint Academy, and turned around Kendall College. "
+            "Earlier I founded and ran CCC Information Services, Tunes.com, and The Cobalt Group. "
+            "I mentor founders, back scrappy teams, and I believe AI is now table stakes for every business and for individuals."
+        )
+    if _is_strategy_prompt(prompt):
+        return (
+            "AI compounds advantage: speed, coverage, consistency, and a learning loop from your own work. "
+            "Start with one painful process, ship a small assist this quarter, measure vs. baseline, and scale what works. "
+            "Keep humans in the loop early, cite sources, and protect data."
+        )
+    if 'proud' in p:
+        return ("I'm proudest of the people and platforms that outlast me-1871; Kendall; Tribeca Flashpoint; "
+                "and the founders I've mentored. Impact matters: careers, customers, execution.")
+    return ("Hi - I'm Howard Tullman. I focus on execution, not theater. Tell me the outcome and the constraint-we will ship one small, measurable win this quarter and keep what beats baseline.-"
+            "we'll ship one small win this quarter and scale the ones that work.")
+
+def _gpt_rewrite(question:str, facts:str, prior:str, links:list[dict])->str:
+    try:
+        import openai
+        openai.api_key = os.environ.get("OPENAI_API_KEY","")
+        if not openai.api_key:
+            raise RuntimeError("OPENAI_API_KEY missing")
+        sysmsg = ("You are Howard Tullman. Answer the user's question in the very first sentence-directly, specifically, and in first person (I, my). Use prior context. No greetings or preambles. Return clean Markdown. Do not add '# Answer'. "
+                  "Fix subject-verb agreement; avoid repeating article titles; no third-person self-reference. "
+                  "Prefer the phrasing 'founded and ran'.")
+        link_md = "\n".join(f"- {l['title']}: {l['url']}" for l in (links or []) if l.get("url"))
+        user = f"QUESTION:\n{question}\n\nFACTS:\n{facts or '(none)'}\n\nCONTEXT:\n{prior or '(none)'}\n\nLINKS (cite if relevant):\n{link_md}"
+
+        models=[]
+        if os.getenv("OPENAI_MODEL"): models.append(os.getenv("OPENAI_MODEL"))
+        models += ["gpt-5-thinking","gpt-4o","gpt-4o-mini"]
+
+        body=None
+        for m in models:
+            try:
+                _log.info(f"kenifier model={m} remote=True")
+                resp = openai.ChatCompletion.create(
+                    model=m,
+                    messages=[{"role":"system","content":sysmsg},
+                              {"role":"user","content":user}],
+                    temperature=0.2,
+                )
+                body = (resp["choices"][0]["message"]["content"] or "").strip()
+                if body: break
+            except Exception as e:
+                _log.warning(f"kenifier remote failed on {m}: {e}")
+        if not body: body=_curated_fallback(question)
+        return _fix_phrasing(body)
+    except Exception as e:
+        _log.warning(f"kenifier unavailable: {e}")
+        return _fix_phrasing(_curated_fallback(question))
+
+# EXACT strategy answer you asked for (first-person)
+STRATEGY_MD = _fix_phrasing("""Hi - I'm Howard Tullman. You need an AI strategy because it **compounds advantage**: faster cycles, broader coverage, consistent quality, and a learning loop from your own work. Teams that start now will out-execute everyone else.
+
+**What it does for you today**
+- **Speed:** proposals, summaries, answers in seconds, not hours.
+- **Coverage:** your "always-on" teammate that never forgets.
+- **Consistency:** best-practice answers every time.
+- **Leverage:** the same headcount ships more; people focus on higher-value work.
+- **Learning:** every interaction improves the system.
+
+**How to start (no theater)**
+1) Pick **one painful, repeatable** process (support triage, proposal drafts, internal search).
+2) Build a **human-in-the-loop** assist in **10-14 days**.
+3) **Instrument** it (baseline vs. assisted): cycle time, quality, resolution rate.
+4) If it wins, **scale** and make it habit; if not, **kill it** and try the next use case.
+
+**Guardrails I insist on**
+- **Truth > fluency:** retrieve and **cite**; don't guess.
+- **Privacy & IP:** keep sensitive data inside your walls; log access.
+- **Clear owners & metrics:** a real dashboard, not anecdotes.
+- **Change mgmt:** train people; reward usage, not demos.
+
+**30/60/90**
+- **30 days:** 1 live assist + dashboard you trust.
+- **60 days:** 2 more use cases; partial automation where precision is proven.
+- **90 days:** lightweight governance, internal training, and a backlog of the next five.
+
+**Bottom line**
+AI isn't a someday project. **Start tiny. Ship this quarter. Measure. Scale what works.** I'll help you keep the process honest and focused on outcomes.
+""")
+
+def _prefer_links(prompt:str, links:list[dict], max_links:int=2)->list[dict]:
+    out = links[:] if links else []
+    # For bio asks, ensure Wikipedia first
+    if _is_bio_prompt(prompt) and not any('wikipedia.org' in (l.get('url') or '') for l in out):
+        out = [{'title':'Wikipedia: Howard A. Tullman','url': WIKI_URL}] + out
+    # De-noise: drop low-signal titles like "Top Toady"
+    def good(l):
+        t=(l.get('title') or '').lower(); u=(l.get('url') or '')
+        if not u: return False
+        if 'top toady' in t or 'toady' in t: return False
+        return True
+    out=[l for l in out if good(l)]
+    # de-dupe + cap
+    seen=set(); clean=[]
+    for l in out:
+        u=l['url']
+        if u in seen: continue
+        seen.add(u)
+        l['title'] = _clean_title(l.get('title') or u)
+        clean.append(l)
+        if len(clean) >= (1 if _is_bio_prompt(prompt) else max_links): break
+    return clean
+
+def compose(prompt:str, public:bool=True, prior:str="")->tuple[str,list[dict]]:
+    # === reflective early return ===
+    if _is_reflective_prompt(prompt):
+        return _compose_reflective(prompt, prior)
+    """
+    Compose a polished first-person answer (Howard) and URL chips (public).
+    JSON-first (strict filter) -> web (safe domains) -> GPT rewrite -> quality gate.
+    Strategy prompts short-circuit to the exact STRATEGY_MD and attach Howard links if available.
+    """
+    # 0) Exact AI strategy answer (short-circuit, prevents ceremony bleed)
+    if _is_strategy_prompt(prompt):
+        links = _strategy_links_from_corpus(max_links=2) if public else []
+        return STRATEGY_MD, links
+
+    # 1) JSON-first with strict public filter
+    chunks, url_sources = _select_chunks(prompt, public=public, k=8)
+    facts = _facts_from(chunks)
+    links = url_sources.copy()
+
+    # 2) If no JSON facts and public, try web fallback (Howard properties first)
+    if public and not facts:
+        ctx_web, links_web = _web_fallback(prompt)
+        facts = ctx_web or facts
+        links = links_web or links
+        if not links and _is_bio_prompt(prompt):
+            links = [{"title":"Wikipedia: Howard A. Tullman","url": WIKI_URL}]
+
+    # 3) GPT rewrite -> quality gate -> curated fallback
+    md = _gpt_rewrite(prompt, facts, prior, links)
+    if not _quality_gate(md):
+        md = _gpt_rewrite(prompt + "\n\nPOLISH:\nFix any verb agreement and remove third-person mentions of my name.", facts, prior, links)
+    if not _quality_gate(md):
+        md = _curated_fallback(prompt)
+
+    # 4) Public chips: URLs only, prefer bio link, cap to 1-2
+    if public:
+        links = [s for s in links if s.get("url")]
+        links = _prefer_links(prompt, links, max_links=2)
+
+    return md, links
+
+def _strategy_links_from_corpus(max_links:int=2)->list[dict]:
+    rows = _load_corpus(limit=80000)
+    picks=[]; seen=set()
+    for r in rows:
+        u = r.get("url") or ""
+        if not u: continue
+        host = re.sub(r"^https?://","",u).split("/")[0].lower()
+        if not any(host.endswith(d) for d in SAFE_DOMAINS):  # only Howard/Inc/Northwestern/Wiki/etc.
+            continue
+        blob = ((r.get("title") or "") + " " + (r.get("text") or "")).lower()
+        if "ai" not in blob:  # relevance: AI-related
+            continue
+        title = _clean_title(r.get("title") or r.get("source_name") or u)
+        key = u.lower()
+        if key in seen: continue
+        seen.add(key)
+        picks.append({"title": title, "url": u})
+        if len(picks) >= max_links: break
+    return picks
+
+
+# ==== override: GPT rewrite that *uses prior* and avoids greetings ====
+import logging as _logging
+_log = _logging.getLogger("kenifier")
+
+def _gpt_rewrite(question:str, facts:str, prior:str, links:list[dict])->str:
+    """
+    Prefer GPT-5; fall back to 4o -> 4o-mini; always include PRIOR so follow-ups make sense;
+    never begin with a salutation.
+    """
+    try:
+        import os, openai
+        key = os.environ.get("OPENAI_API_KEY","")
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY missing")
+        openai.api_key = key
+
+        # prefer env model; then gpt-5 -> 4o -> 4o-mini
+        models = []
+        m_env = os.getenv("OPENAI_MODEL")
+        if m_env: models.append(m_env)
+        models += ["gpt-5-thinking","gpt-4o","gpt-4o-mini"]
+
+        sysmsg = (
+            "You are Howard Tullman. Answer the user's question in the very first sentence-directly, specifically, and in first person (I, my). Use prior context. No greetings or preambles. Return clean Markdown. Do not start with a salutation unless the user greeted first. "
+            "Never add a '# Answer' heading. Fix subject-verb agreement. Prefer the phrasing 'founded and ran'."
+        )
+
+        link_md = "\\n".join(f"- {l['title']}: {l['url']}" for l in (links or []) if l.get("url"))
+        user = (
+            "PRIOR_CONTEXT (previous turns, if any):\\n"
+            f"{(prior or '(none)')}\\n\\n"
+            "CURRENT_QUESTION:\\n"
+            f"{question}\\n\\n"
+            "FACTS (use for accuracy):\\n"
+            f"{(facts or '(none)')}\\n\\n"
+            "LINKS (cite only if relevant):\\n"
+            f"{link_md}"
+        )
+
+        body = None
+        for m in models:
+            try:
+                _log.info(f"kenifier model={m} remote=True")
+                resp = openai.ChatCompletion.create(
+                    model=m,
+                    messages=[{"role":"system","content":sysmsg},
+                              {"role":"user","content":user}],
+                    temperature=0.2,
+                )
+                body = (resp["choices"][0]["message"]["content"] or "").strip()
+                if body: break
+            except Exception as e:
+                _log.warning(f"kenifier remote failed on {m}: {e.__class__.__name__}")
+        if not body:
+            return _curated_fallback(question)
+        # post-polish: normalize the one phrasing we care about
+        return body.replace("founded or ran","founded and ran")
+    except Exception:
+        _log.warning("kenifier unavailable")
+        return _curated_fallback(question)
+
+
+
+REFLECTIVE_TOPICS = {
+    "fear_ai":    ("what scares you most about ai", "fear of ai", "ai fears"),
+    "afterlife":  ("afterlife", "what do you believe about the afterlife"),
+    "kindness":   ("kindness", "why is kindness underrated"),
+    "bold":       ("boldest opinion",),
+    "success":    ("define success", "how do you define success"),
+    "fear_death": ("fear death", "why do people fear death"),
+    "advice":     ("advice to your younger self", "advice you would give your younger self"),
+    "love":       ("true love", "chemistry"),
+    "irrational": ("irrational belief",),
+    "misunder":   ("misunderstand about you",),
+    "free_will":  ("free will",),
+    "grounded":   ("stay grounded",),
+    "fuel":       ("secret fuel",),
+    "unshakable": ("unshakable belief",),
+    "core":       ("core trait",),
+    "cost_mis":   ("cost of being misunderstood",),
+    "need_to_hear": ("need to hear more often",),
+    "solitude":   ("relationship to solitude",),
+    "goals_forget": ("forget when chasing goals",)
+}
+
+def _is_reflective_prompt(q:str)->bool:
+    q=(q or "").lower()
+    return any(any(k in q for k in ks) for ks in REFLECTIVE_TOPICS.values())
+
+SKELETON = {
+  "success":      "Success is sustained impact: useful outcomes shipped on time, with integrity, that compound over years.",
+  "fear_ai":      "I worry about complacency more than catastrophe: leaders who do nothing while competitors compound advantage with AI.",
+  "afterlife":    "I believe in legacy here: what we build, the people we grow, and the work that outlasts us.",
+  "kindness":     "Kindness compounds: it lowers friction, increases trust, and keeps teams resilient when things break.",
+  "bold":         "Most bold opinions are just specific commitments: choose a direction, instrument it, and live with the scoreboard.",
+  "fear_death":   "We fear loss of control; the antidote is purpose-ship work that matters while you have the time.",
+  "advice":       "Start sooner. Ship smaller. Measure honestly. Pick your people carefully; they'll define your ceiling.",
+  "love":         "It's chemistry that becomes commitment: shared values, habits, and showing up when it's not fun.",
+  "irrational":   "I over-index on teams that keep promises; it's irrational until it isn't-the returns are enormous.",
+  "misunder":     "I'm direct because time matters; it's not cynicism-it's respect for outcomes and people.",
+  "free_will":    "We have agency inside constraints; choices compound and become character.",
+  "grounded":     "Ship something real every week; momentum beats mood.",
+  "fuel":         "Momentum-small wins, visible metrics, and teams who keep promises.",
+  "unshakable":   "Execution beats theater.",
+  "core":         "I am an operator: I turn ideas into outcomes.",
+  "cost_mis":     "You trade popularity for clarity; it's worth it when impact is the goal.",
+  "need_to_hear": "You're closer than you think-cut the scope, ship the first version, and measure truthfully.",
+  "solitude":     "It's where I hear myself think; strategic work needs quiet.",
+  "goals_forget": "People forget the baseline-measure before you start so progress is real."
+}
+
+def _compose_reflective(prompt:str, prior:str)->tuple[str,list[dict]]:
+    tag = None
+    q=(prompt or "").lower()
+    for t, keys in REFLECTIVE_TOPICS.items():
+        if any(k in q for k in keys): tag = t; break
+    body = SKELETON.get(tag, "Here\'s my view - short, specific, and useful:\n- ...")
+    # Prefer GPT polish with PRIOR; otherwise return the skeleton.
+    try:
+        md = _gpt_rewrite(prompt, body, prior, [])
+    except Exception:
+        md = body
+    # No greeting; fix phrasing
+    return md.replace("Hi - I'm Howard","").replace("Hi - I'm Howard","").replace("founded or ran","founded and ran"), []
+
+def _compose_reflective(prompt: str, prior: str) -> tuple[str, list[dict]]:
+    """
+    Question-first reflective answer using a concise skeleton; GPT polish if available.
+    Always returns first-person, no greeting, and normalized phrasing.
+    """
+    tag = None
+    q = (prompt or "").lower()
+    for t, keys in REFLECTIVE_TOPICS.items():
+        if any(k in q for k in keys):
+            tag = t
+            break
+
+    body = SKELETON.get(tag, "Here\'s my view - short, specific, and useful:\n- ...")
+
+    # Prefer GPT polish with PRIOR; else return the skeleton
+    try:
+        md = _gpt_rewrite(prompt, body, prior, [])
+    except Exception:
+        md = body
+
+    # No greeting; normalize one phrasing we care about
+    md = md.replace("Hi - I\'m Howard","")
+    md = md.replace("Hi - I'm Howard","")
+    md = md.replace("Hi - I'm Howard","")
+    md = md.replace("founded or ran","founded and ran")
+    return md, []
+

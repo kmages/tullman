@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Log File</title>
+<style>
+  body{font-family:system-ui,Arial,sans-serif;margin:24px}
+  .row{border:1px solid #ddd;border-radius:8px;padding:12px;margin-bottom:12px}
+  .row.selected{outline:2px solid #0b5;background:#f5fff7}
+  .meta{color:#666;font-size:.9em;margin-bottom:6px;display:flex;gap:12px;flex-wrap:wrap}
+  .qa{margin:6px 0}.actions{display:flex;gap:8px;margin-top:8px}
+  button{padding:6px 10px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer}
+  .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .badge{font-weight:600}.toast{min-height:1.2em}.backtop{position:fixed;bottom:24px;right:24px}
+</style>
+<div class="topbar">
+  <div class="badge" data-review-queue-header>Review Queue (0 items pending)</div>
+  <div class="toast" data-toast></div>
+</div>
+<div id="list"></div>
+<button class="backtop" id="btnTop">Back to top</button>
+<script type="module" src="/frontend/log.js"></script>

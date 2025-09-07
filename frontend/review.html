@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Review Queue</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root{ --bg:#fafafa; --card:#fff; --border:#ddd; --muted:#666; --accent:#0b5; --warn:#c33; }
+    body{font-family:Arial,Helvetica,sans-serif;margin:24px;background:var(--bg);color:#111}
+    h1{margin:.2em 0 12px}
+    .sub{color:var(--muted); margin:6px 0 18px}
+    .counter{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:4px 10px;background:#f7f7f7;margin-right:10px}
+    .counter.warn{border-color:var(--warn);background:#fee;color:#600}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;margin:12px 0}
+    .qa{border:1px solid #eee;border-radius:10px;padding:12px;margin:10px 0;background:#fff}
+    .qa.selected{outline:2px solid var(--accent);background:#f6fff8}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .btn{padding:8px 12px;border:1px solid var(--border);border-radius:10px;background:#fff;cursor:pointer}
+    .btn[disabled]{opacity:.6;cursor:progress}
+    .msg{font-size:.9em;color:#333;margin-left:6px;min-height:1.2em}
+    .muted{color:var(--muted)}
+    .list-empty{font-style:italic;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <h1>Review Queue</h1>
+  <div class="sub">Process pending items from Front Page or Log File.</div>
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <span id="badge" class="counter">Review Queue (…)</span>
+      <a class="btn" href="/admin">Admin</a>
+      <a class="btn" href="/log">Log</a>
+      <a class="btn" href="/examples">Examples</a>
+    </div>
+    <div class="row">
+      <button id="refresh" class="btn">Refresh</button>
+    </div>
+  </div>
+
+  <div id="toast" class="muted" style="min-height:1.2em;margin:6px 0"></div>
+
+  <div class="card">
+    <div id="list" aria-live="polite" class="list-empty">Loading…</div>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const badge = $('badge'), list = $('list'), toast = $('toast');
+
+    function say(t, ms=1600){ toast.textContent=t; if(ms) setTimeout(()=>toast.textContent='', ms); }
+    function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function btn(label, handler){
+      const b = document.createElement('button'); b.className='btn'; b.textContent=label;
+      b.onclick = async () => { b.disabled=true; try{ await handler(); } finally{ b.disabled=false; } };
+      return b;
+    }
+    async function api(path, opts={}){
+      const r = await fetch(path, { headers:{'Content-Type':'application/json'}, ...opts });
+      const ct = r.headers.get('content-type')||'';
+      const body = ct.includes('application/json') ? await r.json().catch(()=>({})) : await r.text().catch(()=> '');
+      if(!r.ok){ throw new Error(typeof body==='string'?body:JSON.stringify(body)); }
+      return body;
+    }
+
+    function render(items){
+      // Counter
+      badge.textContent = `Review Queue (${items.length} items pending)`;
+      badge.className = 'counter' + (items.length ? ' warn' : '');
+
+      // List
+      if(!items.length){ list.className='list-empty'; list.textContent='No items queued.'; return; }
+      list.className=''; list.innerHTML='';
+      items.forEach(it=>{
+        const el = document.createElement('div'); el.className='qa'; el.tabIndex=0;
+        el.innerHTML = `
+          <div class="muted">ID ${it.id} • ${esc(it.date_id||'')} • status: ${esc(it.status||'')}</div>
+          <div><b>Q:</b> ${esc(it.question||'')}</div>
+          <div style="margin-top:6px;"><b>A:</b> ${esc(it.answer||'')}</div>
+        `;
+        const row = document.createElement('div'); row.className='row'; row.style.marginTop='8px';
+        const msg = document.createElement('span'); msg.className='msg';
+
+        // Buttons: Send / Archive / Delete / Back
+        row.append(
+          btn('Send to Loop2', async ()=>{
+            msg.textContent='Sending…';
+            const res = await api(`/api/log/${it.id}/action`, {method:'PATCH', body:JSON.stringify({action:'send_to_loop2'})});
+            msg.textContent='Sent.';
+            // Show the Loop2 prefill once (helpful for copy)
+            if(res && res.loop2_prefill){
+              alert(`BOX1:\n${res.loop2_prefill.box1}\n\nBOX2:\n${res.loop2_prefill.box2}\n\nBOX3:\n${res.loop2_prefill.box3}`);
+            }
+            await load();
+          }),
+          btn('Archive', async ()=>{
+            msg.textContent='Archiving…';
+            await api(`/api/log/${it.id}/action`, {method:'PATCH', body:JSON.stringify({action:'archive'})});
+            msg.textContent='Archived.'; await load();
+          }),
+          btn('Delete', async ()=>{
+            msg.textContent='Deleting…';
+            await api(`/api/log/${it.id}/action`, {method:'PATCH', body:JSON.stringify({action:'delete'})});
+            msg.textContent='Deleted.'; await load();
+          }),
+          btn('Back', async ()=>{
+            el.classList.remove('selected'); msg.textContent=''; // visual only
+          }),
+          msg
+        );
+
+        el.addEventListener('click', ()=>{ document.querySelectorAll('.qa').forEach(d=>d.classList.remove('selected')); el.classList.add('selected'); });
+        el.addEventListener('keydown', (ev)=>{ if(ev.key==='Enter' || ev.key===' '){ ev.preventDefault(); el.click(); }});
+        el.append(row); list.append(el);
+      });
+    }
+
+    async function load(){
+      try{
+        list.textContent='Loading…'; list.className='list-empty';
+        const data = await api('/api/review-queue');
+        render(data.items || []);
+      }catch(e){
+        list.className='list-empty'; list.textContent='Failed to load.';
+        say('Queue load failed: '+e.message, 2600);
+      }
+    }
+
+    $('refresh').onclick = load;
+    load();
+  </script>
+</body>
+</html>

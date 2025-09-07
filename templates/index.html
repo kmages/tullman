@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tullman.ai — Ask Me Anything</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+body{margin:0;background:#fff;color:#111}.wrap{max-width:880px;margin:0 auto;padding:32px 16px 80px}
+h1{font-size:2.2rem;margin:0 0 8px}.lead{margin:0 0 20px;color:#444}
+.box{display:grid;gap:12px}textarea{width:100%;min-height:120px;padding:12px;font-size:1rem;border:1px solid #ccc;border-radius:10px;outline:none}
+button{padding:12px 16px;font-size:1rem;border:0;border-radius:10px;cursor:pointer;background:#0a7;color:#fff}
+button:disabled{opacity:.6;cursor:not-allowed}.chat{margin-top:28px;border-top:1px solid #eee;padding-top:20px}
+.q,.a{padding:12px 14px;border-radius:10px;margin:8px 0;white-space:pre-wrap}.q{background:#f7f7f7}.a{background:#eefaf4}
+.small{color:#666;font-size:.9rem;margin-top:12px}footer{position:fixed;bottom:0;left:0;right:0;padding:10px 16px;background:#111;color:#eee;font-size:.9rem}
+.footwrap{max-width:880px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:8px}a{color:#2a7;text-decoration:none}a:hover{text-decoration:underline}
+</style>
+<div class="wrap">
+  <h1>Ask Me Anything</h1>
+  <p class="lead">No login. Ask a question, get an answer. Every reply goes to a private review queue.</p>
+  <div class="box">
+    <textarea id="prompt" placeholder="Type your question…"></textarea>
+    <button id="askBtn">Ask</button>
+  </div>
+  <div id="chat" class="chat" aria-live="polite"></div>
+  <div class="small">Powered by the Just Ken engine.</div>
+</div>
+<footer><div class="footwrap"><div>Tullman.ai</div><div><a href="mailto:info@tullman.ai">Contact</a></div></div></footer>
+<script>
+const askBtn=document.getElementById('askBtn');const promptEl=document.getElementById('prompt');const chat=document.getElementById('chat');
+function addBubble(t,c){const d=document.createElement('div');d.className=c;d.textContent=t;chat.appendChild(d);d.scrollIntoView({behavior:'smooth',block:'end'});}
+async function send(){const p=promptEl.value.trim();if(!p)return;askBtn.disabled=true;addBubble(p,'q');promptEl.value='';
+ try{const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:p})});
+ const data=await r.json(); if(!r.ok) throw new Error(data.error||'Request failed'); addBubble(data.answer,'a');
+ }catch(err){addBubble('Error: '+err.message,'a')}finally{askBtn.disabled=false}}
+askBtn.addEventListener('click',send);
+promptEl.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey))send();});
+</script>

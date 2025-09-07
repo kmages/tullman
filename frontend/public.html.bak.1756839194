@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title data-v=1756211352 >Tullman.ai — Ask Howard</title>
+  <meta name="color-scheme" content="dark light">
+  <style>
+    :root{--bg:#0b0f17;--text:#e9eefc;--muted:#8ea2c8;--line:#1e2b47;--card:#121826;--accent:#4ea1ff}
+    body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .wrap{max-width:960px;margin:40px auto;padding:0 18px}
+    h1{margin:0 0 10px 0}
+    .status{margin:8px 0 16px 0;color:var(--muted);font-size:14px;white-space:pre-wrap}
+    .sky{margin:12px 0 20px}
+    .sky img{display:block;width:100%;max-height:280px;object-fit:contain}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+    .row{display:flex;gap:8px;align-items:center;margin-top:12px}
+    input{flex:1;border:1px solid var(--line);border-radius:10px;padding:11px;background:#0d1320;color:var(--text)}
+    button{background:var(--accent);color:#001633;border:0;border-radius:10px;padding:11px 14px;font-weight:700;cursor:pointer}
+    .chip{display:inline-block;margin:0 8px 8px 0;border:1px solid var(--line);border-radius:999px;padding:6px 10px;color:var(--muted);background:transparent;cursor:pointer}
+    .thread{margin-top:10px;max-height:58vh;overflow:auto}
+    .msg{border-top:1px solid var(--line);padding:10px 0}
+    .role{color:var(--muted);font-size:13px;margin-bottom:4px}
+    .chips a{display:inline-block;margin-right:8px;color:var(--muted);text-decoration:none;border-bottom:1px dashed var(--line)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Ask Howard</h1>
+    <div id="status" class="status">status: checking…</div>
+<script>fetch("/meta").then(r=>r.json()).then(j=>{const el=document.querySelector(".status");if(el) el.textContent="status: "+(j.service||"unknown")+" · library: 197 items";}).catch(()=>{const el=document.querySelector(".status");if(el) el.textContent="status: offline";});</script>
+<script>fetch("/meta").then(r=>r.json()).then(j=>document.getElementById("status").textContent="status: "+(j.service||"unknown")).catch(()=>document.getElementById("status").textContent="status: offline");</script>
+
+    <div class="sky"><img src="/assets/chi.png" alt="Chicago skyline"></div>
+
+    <div class="card">
+      <div id="starters">
+        <button class="chip" data-q="Is consistency overrated if it means being reliably average?">CONSISTENCY</button>
+        <button class="chip" data-q="What is the difference between loyalty and reliability?">LOYALTY vs RELIABILITY</button>
+        <button class="chip" data-q="What do people get wrong about kindness, and why does it matter?">KINDNESS</button>
+        <button class="chip" data-q="How often do you spend time thinking about the past?">THE PAST</button>
+        <button class="chip" data-q="What single trait defines you at your core?">CORE TRAIT</button>
+</div>
+
+      <div id="thread" class="thread"></div>
+
+      <div class="row">
+        <input id="q" placeholder="Ask Howard… (Enter to send)"/>
+        <button id="send">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  // visible logging
+  const $ = s => document.querySelector(s);
+  const statusEl = $('#status'), thread = $('#thread'), qEl = $('#q'), sendBtn = $('#send');
+  function log(msg){ statusEl.textContent = 'status: ' + msg; }
+  function escapeHtml(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+  function add(role, text, sources){
+    const el = document.createElement('div');
+    el.className = 'msg';
+    el.innerHTML = `<div class="role">${escapeHtml(role)}</div><div>${escapeHtml(text||'')}</div>`;
+    if (Array.isArray(sources) && sources.length){
+      el.innerHTML += `<div class="chips">` + sources.filter(x=>x&&x.url)
+        .map(x=>`<a href="${x.url}" target="_blank" rel="noopener">${escapeHtml(x.title||x.url)}</a>`).join(' ') + `</div>`;
+    }
+    thread.appendChild(el); thread.scrollTop = thread.scrollHeight;
+  }
+
+  let sessionId = null;
+
+  async function sendPrompt(prompt){
+    if(!prompt) return;
+    add('You', prompt);
+    log('sending /retrieve…');
+    try{
+      const payload = {prompt, public:true};
+      if(sessionId) payload.session_id = sessionId;
+      const r = await fetch('/retrieve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({prompt: prompt})});
+      const txt = await r.text();
+      if(!r.ok){ add('System', `HTTP ${r.status}: ${txt.slice(0,120)}`); log('HTTP '+r.status); return; }
+      let j = {}; try{ j = JSON.parse(txt); }catch{ add('System','Bad JSON: '+txt.slice(0,120)); log('bad JSON'); return; }
+      sessionId = j.session_id || sessionId;
+      add('Howard', j.answer || '(empty)', j.sources || []);
+      log('ok');
+    }catch(e){ add('System', 'Network error: '+e); log('network error'); }
+  }
+
+  // bindings
+  sendBtn?.addEventListener('click', ()=>{ const p=qEl.value.trim(); qEl.value=''; sendPrompt(p); });
+  qEl?.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); const p=qEl.value.trim(); qEl.value=''; sendPrompt(p); }});
+  $('#starters')?.addEventListener('click', e=>{ const b=e.target.closest('[data-q]'); if(b){ sendPrompt(b.getAttribute('data-q')); }});
+
+  // health ping
+  (async ()=>{ try{
+    const r=await fetch('/meta'); const j=await r.json();
+    log(`health ok · library: ${j?.total ?? '—'} items`);
+  }catch{ log('health error'); }})();
+
+  // catch JS errors visibly
+  window.addEventListener('error', e=> log('JS error: '+e.message));
+  </script>
+<script src="/assets/chips_override.js?v=1756832704"></script>
+<script src="/assets/starters.js?v=1756839085"></script>
+</body>
+<script>(function(){if(navigator.serviceWorker){navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister()));}})();</script>
+</html>

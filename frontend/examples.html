@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Examples Admin</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 20px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom: 10px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:12px; margin-bottom: 14px; }
+    .btn { padding:8px 12px; border:1px solid #ccc; border-radius:8px; background:white; cursor:pointer; }
+    .btn[disabled] { opacity:.6; cursor:progress; }
+    .toast { min-height: 1.2em; margin: 8px 0; color:#333; }
+    input[type="number"]{ width:90px; padding:6px; }
+    #examplesList > div { border:1px solid #eee; border-radius:8px; padding:10px; margin:8px 0; }
+    .meta { color:#666; font-size:.9em; margin-bottom:6px; }
+  </style>
+</head>
+<body>
+  <h2>Examples Admin</h2>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnExport" class="btn">Export JSONL</button>
+      <span id="exportHint" style="color:#666;">Downloads <code>examples_backup.jsonl</code></span>
+    </div>
+    <div class="row">
+      <label>min_count:
+        <input id="minCount" type="number" value="2" min="1" />
+      </label>
+      <label>limit_max:
+        <input id="limitMax" type="number" value="1000" min="1" />
+      </label>
+      <label>
+        <input id="includeExcluded" type="checkbox" />
+        include_excluded (skip sensitive)
+      </label>
+      <button id="btnRecover" class="btn">Recover from Log</button>
+      <span id="recoverHint" style="color:#666;">Promote Log Q→A to locked Examples</span>
+    </div>
+    <div class="toast" id="toast"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <strong>Examples</strong>
+      <span id="count">(loading…)</span>
+    </div>
+    <div id="examplesList"></div>
+  </div>
+
+  <script type="module" src="/frontend/examples.js"></script>
+</body>
+</html>

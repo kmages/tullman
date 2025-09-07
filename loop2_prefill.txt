@@ -1,0 +1,9 @@
+BOX1:
+Test: how do I invite a user?
+
+BOX2:
+Use Admin > Users > Invite.
+
+BOX3:
+Use Admin > Users > Invite.
+

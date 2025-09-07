@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from flask import Flask, jsonify, request, send_from_directory
+from pathlib import Path
+from collections import deque, OrderedDict
+import os, json, re, logging
+
+from app.composer import compose
+
+# ---------- paths ----------
+BASE     = Path.home() / "tullman"
+FRONTEND = BASE / "frontend"
+ASSETS   = Path("/var/www/tullman/assets")
+DATA     = BASE / "data"
+CONTENT  = DATA / "content" / "content.jsonl"
+
+# ---------- app ----------
+app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
+##_logging_bridge
+import logging as _lg
+if not _lg.getLogger().handlers:
+    _h=_lg.StreamHandler(); _h.setFormatter(_lg.Formatter("%(levelname)s %(name)s: %(message)s"))
+    _lg.getLogger().addHandler(_h); _lg.getLogger().setLevel(_lg.INFO)
+
+# ---------- helpers ----------
+def _is_strategy_prompt(q: str) -> bool:
+    q = (q or "").lower()
+    keys = (
+        "ai strategy","need an ai strategy","why do i need an ai",
+        "ai roadmap","ai plan","ai for my business"
+    )
+    return any(k in q for k in keys) or ("ai" in q and "strategy" in q)
+
+# Exact AI strategy answer (ASCII only)
+STRATEGY_MD = (
+    "Hi - I'm Howard Tullman. You need an AI strategy because it **compounds advantage**: "
+    "faster cycles, broader coverage, consistent quality, and a learning loop from your own work. "
+    "Teams that start now will out-execute everyone else.\n\n"
+    "**What it does for you today**\n"
+    "- **Speed:** proposals, summaries, answers in seconds, not hours.\n"
+    "- **Coverage:** your \"always-on\" teammate that never forgets.\n"
+    "- **Consistency:** best-practice answers every time.\n"
+    "- **Leverage:** the same headcount ships more; people focus on higher-value work.\n"
+    "- **Learning:** every interaction improves the system.\n\n"
+    "**How to start (no theater)**\n"
+    "1) Pick **one painful, repeatable** process (support triage, proposal drafts, internal search).\n"
+    "2) Build a **human-in-the-loop** assist in **10-14 days**.\n"
+    "3) **Instrument** it (baseline vs. assisted): cycle time, quality, resolution rate.\n"
+    "4) If it wins, **scale** and make it habit; if not, **kill it** and try the next use case.\n\n"
+    "**Guardrails I insist on**\n"
+    "- **Truth > fluency:** retrieve and **cite**; don't guess.\n"
+    "- **Privacy & IP:** keep sensitive data inside your walls; log access.\n"
+    "- **Clear owners & metrics:** a real dashboard, not anecdotes.\n"
+    "- **Change mgmt:** train people; reward usage, not demos.\n\n"
+    "**30/60/90**\n"
+    "- **30 days:** 1 live assist + dashboard you trust.\n"
+    "- **60 days:** 2 more use cases; partial automation where precision is proven.\n"
+    "- **90 days:** lightweight governance, internal training, and a backlog of the next five.\n\n"
+    "**Bottom line**\n"
+    "AI isn't a someday project. **Start tiny. Ship this quarter. Measure. Scale what works.** "
+    "I'll help you keep the process honest and focused on outcomes."
+)
+
+def _strategy_links_from_corpus(max_links: int = 2):
+    """Return up to 2 relevant Howard links about AI/strategy (blog/Inc/Northwestern)."""
+    try:
+        picks, seen = [], set()
+        if not CONTENT.exists():
+            return picks
+        SAFE = ("howardtullman.com","tullman.blogspot.com","blogspot.com","inc.com","northwestern.edu")
+        with CONTENT.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except:
+                    continue
+                u = (r.get("url") or "").strip()
+                if not u:
+                    continue
+                host = re.sub(r"^https?://","",u).split("/")[0].lower()
+                if not any(host.endswith(d) for d in SAFE):
+                    continue
+                title = (r.get("title") or r.get("source_name") or u)
+                text  = (r.get("text") or "")
+                blob  = f"{title} {text}".lower()
+                if "ai" not in blob and "artificial intelligence" not in blob and "strategy" not in blob:
+                    continue
+                low_t = title.lower()
+                if "top toady" in low_t or "roberts" in low_t:
+                    continue
+                key = u.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                picks.append({"title": title, "url": u})
+                if len(picks) >= max_links:
+                    break
+        return picks
+    except Exception:
+        return []
+
+# ---------- sessions ----------
+SESSIONS: "OrderedDict[str, deque[tuple[str,str]]]" = OrderedDict()
+MAX_TURNS=16
+MAX_SESS =200
+def get_session(sid: str | None):
+    sid = sid or os.urandom(16).hex()
+    sess = SESSIONS.get(sid)
+    if sess is None:
+        sess = deque(maxlen=MAX_TURNS); SESSIONS[sid]=sess
+        if len(SESSIONS)>MAX_SESS: SESSIONS.popitem(last=False)
+    else:
+        SESSIONS.move_to_end(sid)
+    return sid, sess
+
+# ---------- routes ----------
+
+def strip_greeting(text: str, has_prior: bool) -> str:
+    """
+    Remove a leading "Hi ... I'm Howard Tullman." only on follow-ups.
+    ASCII-safe; handles hyphen/em-dash by codepoint.
+    """
+    if not has_prior or not isinstance(text, str):
+        return text
+    t = text.lstrip()
+    low = t.lower()
+    # quick gate: must start with "hi" and mention "howard tullman" near the start
+    if not low.startswith('hi') or 'howard tullman' not in low[:80]:
+        return text
+    # find end of the "howard tullman" mention
+    i = low.find('howard tullman')
+    if i == -1:
+        return text
+    j = i + len('howard tullman')
+    # skip punctuation/spaces (., !, space, hyphen '-', en dash U+2013, em dash U+2014)
+    dashes = {45, 8211, 8212}
+    k = j
+    while k < len(t):
+        ch = t[k]
+        if ch in '.! ' or ord(ch) in dashes:
+            k += 1
+        else:
+            break
+    return t[k:].lstrip()
+
+@app.get("/health")
+def health():
+    counts={}
+    if CONTENT.exists():
+        with CONTENT.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    j=json.loads(line)
+                    t=j.get("source_type","unknown")
+                    counts[t]=counts.get(t,0)+1
+                except:
+                    pass
+    return jsonify({"ok": True, "total": sum(counts.values()), "counts": counts})
+
+@app.get("/assets/<path:fname>")
+def assets(fname):
+    return send_from_directory(ASSETS, fname)
+
+@app.get("/")
+def home():
+    html = FRONTEND / "public.html"
+    if html.exists(): return send_from_directory(html.parent, html.name)
+    return jsonify({"ok": True, "msg": "Public page missing"}), 200
+
+
+
+@app.post("/chat")
+def chat():
+    """Public chat: early-return exact strategy answer; otherwise compose(). Always JSON."""
+    try:
+        j = request.get_json(force=True, silent=True) or {}
+        q = (j.get("prompt") or "").strip()
+        # allocate session & prior up-front so all returns include a session id
+        sid, hist = get_session(j.get("session_id"))
+        prior = " ".join(f"{r}: {c}" for r, c in list(hist)[-8:])
+
+        if not q:
+            return jsonify({"session_id": sid, "answer": "Ask a question first.", "sources": []})
+
+        # AI strategy: exact answer + filtered Howard links; strip greeting always
+        if _is_strategy_prompt(q):
+            try:
+                links = _strategy_links_from_corpus(max_links=2)
+            except Exception:
+                links = []
+            resp = strip_greeting(STRATEGY_MD, bool(prior.strip()))
+            return jsonify({"session_id": sid, "answer": resp, "sources": links})
+
+        # normal flow
+        answer, links = compose(q, public=True, prior=prior)
+        answer = strip_greeting(answer, bool(prior.strip()))
+        hist.append(("user", q)); hist.append(("assistant", answer))
+        return jsonify({"session_id": sid, "answer": answer, "sources": links})
+
+    except Exception:
+        try: app.logger.exception("chat_error")
+        except Exception: pass
+        return jsonify({"session_id": j.get("session_id") if isinstance(j, dict) else None,
+                        "answer": "Sorry - server error. Please try again.",
+                        "sources": []}), 500
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

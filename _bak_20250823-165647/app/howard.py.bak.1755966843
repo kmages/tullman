@@ -1,0 +1,127 @@
+# ASCII-only: JSON → GPT-5 (Howard) → Kenifier
+from pathlib import Path
+import os, json, re, logging
+_log = logging.getLogger("howard")
+
+BASE     = Path.home() / "tullman"
+CONTENT  = BASE / "data" / "content" / "content.jsonl"
+
+VOICEPRINT = (
+    "You are Howard Tullman. Write in first person (I, my). "
+    "No greetings. Answer the user's question in the VERY FIRST sentence, "
+    "then give brief rationale (bullets if useful). Be direct, practical, operator-minded. "
+    'Prefer "founded and ran" (never "founded or ran"). Avoid throat-clearing. '
+    "If you cite, do it as short chips (Title - URL). Return clean Markdown."
+)
+
+_cache = None
+def _load_rows(limit=20000):
+    global _cache
+    if _cache is not None:
+        return _cache
+    rows = []
+    if CONTENT.exists():
+        with CONTENT.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except:
+                    pass
+                if i >= limit:
+                    break
+    _cache = rows
+    _log.info("howard.jsonl rows=%d", len(rows))
+    return _cache
+
+def _score(q, text):
+    ql = (q or "").lower()
+    tl = (text or "").lower()
+    if not tl:
+        return 0
+    terms = set(re.findall(r"[a-z0-9]{4,}", ql))
+    return sum(tl.count(t) for t in terms)
+
+def weave_from_json(prompt, k=6, max_chars=1800):
+    rows = _load_rows()
+    scored = []
+    for r in rows:
+        t = r.get("text") or ""
+        s = _score(prompt, t)
+        if s > 0:
+            scored.append((s, r))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    parts, links = [], []
+    total = 0
+    for _, r in scored[:k]:
+        txt = (r.get("text") or "").strip()
+        if not txt:
+            continue
+        snip = re.sub(r"\s+", " ", txt)[:400]
+        parts.append(f"- {snip}")
+        u = (r.get("url") or "").strip()
+        if u:
+            title = (r.get("title") or r.get("source_name") or u).strip()
+            links.append({"title": title, "url": u})
+        total += len(snip)
+        if total >= max_chars:
+            break
+    return "\n".join(parts), links[:4]
+
+def _gpt(prompt, prior, weave, links):
+    try:
+        import openai
+        openai.api_key = os.environ.get("OPENAI_API_KEY", "")
+        models = []
+        envm = os.environ.get("OPENAI_MODEL", "").strip()
+        if envm:
+            models.append(envm)
+        models += ["gpt-5-thinking", "gpt-4o", "gpt-4o-mini"]
+
+        link_md = "\n".join(f"- {l['title']}: {l['url']}" for l in (links or []) if l.get("url"))
+        sysmsg = VOICEPRINT
+        user = (
+            "PRIOR_CONTEXT:\n" + (prior or "(none)")
+            + "\n\nPROMPT:\n" + (prompt or "")
+            + ("\n\nWEAVE:\n" + weave if weave else "")
+            + ("\n\nLINKS:\n" + link_md if link_md else "")
+        )
+        for m in models:
+            try:
+                _log.info("howard.gpt model=%s", m)
+                resp = openai.ChatCompletion.create(
+                    model=m,
+                    messages=[{"role": "system", "content": sysmsg},
+                              {"role": "user",   "content": user}],
+                    temperature=0.2,
+                )
+                text = (resp["choices"][0]["message"]["content"] or "").strip()
+                if text:
+                    return text
+            except Exception as e:
+                _log.warning("howard.gpt fail %s: %s", m, e.__class__.__name__)
+    except Exception as e:
+        _log.warning("howard.gpt unavailable: %s", e.__class__.__name__)
+    return ""
+
+def _kenify(prompt, md, sources):
+    """
+    Try a lightweight kenifier without importing server to avoid circular imports.
+    If none is available, return md unchanged.
+    """
+    try:
+        # If you have a kenifier in composer, prefer that
+        from app.composer import kenify_markdown as _k
+        return _k(prompt, md, sources)
+    except Exception:
+        return md
+
+def answer(prompt: str, prior: str):
+    weave, links = weave_from_json(prompt)
+    draft = _gpt(prompt, prior, weave, links) or ""
+    if not draft:
+        draft = "I answer directly and concretely - give me the outcome you want and the constraint in your way."
+    md = _kenify(prompt, draft, links)
+    return md, links

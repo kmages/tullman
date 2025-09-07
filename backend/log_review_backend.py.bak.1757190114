@@ -1,0 +1,252 @@
+# /home/kmages/tullman/backend/log_review_backend.py
+import os, json
+from datetime import datetime
+from pathlib import Path
+from flask import Flask, request, jsonify, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.utils import secure_filename
+
+# ---------- Config ----------
+DB_PATH       = os.path.expanduser('~/tullman/app.db')
+ARCHIVE_PATH  = os.path.expanduser('~/tullman/archive/archive.jsonl')
+RULES_PATH    = os.path.expanduser('~/tullman/rules.json')
+FRONTEND_DIR  = os.path.expanduser('~/tullman/frontend')
+CORPUS_DIR    = os.path.expanduser('~/tullman/corpus')
+
+Path(ARCHIVE_PATH).parent.mkdir(parents=True, exist_ok=True)
+Path(FRONTEND_DIR).mkdir(parents=True, exist_ok=True)
+Path(CORPUS_DIR).mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_PATH}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# ---------- Models ----------
+class QAPair(db.Model):
+    __tablename__ = 'qa_pairs'
+    id          = db.Column(db.Integer, primary_key=True)
+    created_at  = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    date_id     = db.Column(db.String(32), index=True)
+    question    = db.Column(db.Text, nullable=False)
+    answer      = db.Column(db.Text, default='')
+    status      = db.Column(db.String(32), default='active', index=True)  # active/restored/queued/in_loop2/archived/deleted
+    is_excluded = db.Column(db.Boolean, default=False)
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "date_id": self.date_id,
+            "created_at": (self.created_at or datetime.utcnow()).isoformat() + "Z",
+            "question": self.question,
+            "answer": self.answer,
+            "status": self.status,
+            "is_excluded": bool(self.is_excluded),
+        }
+
+class Example(db.Model):
+    __tablename__ = 'examples'
+    id               = db.Column(db.Integer, primary_key=True)
+    created_at       = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    primary_question = db.Column(db.Text, nullable=False)
+    answer           = db.Column(db.Text, nullable=False)
+    locked           = db.Column(db.Boolean, default=True)
+    active           = db.Column(db.Boolean, default=True)
+
+    def as_dict(self):
+        return {
+            "id": self.id,
+            "created_at": (self.created_at or datetime.utcnow()).isoformat() + "Z",
+            "primary_question": self.primary_question,
+            "answer": self.answer,
+            "locked": bool(self.locked),
+            "active": bool(self.active),
+        }
+
+with app.app_context():
+    db.create_all()
+
+# ---------- Helpers ----------
+@app.before_request
+def ensure_date_id():
+    missing = QAPair.query.filter(QAPair.date_id.is_(None)).all()
+    for it in missing:
+        it.date_id = f"{(it.created_at or datetime.utcnow()).strftime('%Y-%m-%d')}-{it.id:06d}"
+    if missing:
+        db.session.commit()
+
+def archive_append(qa: QAPair):
+    row = {"archived_at": datetime.utcnow().isoformat()+"Z", **qa.as_dict()}
+    with open(ARCHIVE_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+# ---------- Static: /frontend/* ----------
+@app.route("/frontend/<path:fname>", methods=["GET"])
+def frontend_file(fname):
+    return send_from_directory(FRONTEND_DIR, fname)
+
+# ---------- Health ----------
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "service": "log_review_backend"})
+
+# ---------- Rules (GET/PUT) ----------
+@app.route("/api/rules", methods=["GET", "PUT"])
+def rules():
+    if request.method == "GET":
+        txt = ""
+        if os.path.isfile(RULES_PATH):
+            with open(RULES_PATH, "r", encoding="utf-8") as f:
+                txt = f.read()
+        return jsonify({"rules": txt})
+    data = request.get_json(force=True) or {}
+    with open(RULES_PATH, "w", encoding="utf-8") as f:
+        f.write(data.get("rules") or "")
+    return jsonify({"ok": True})
+
+# ---------- Examples (list only for admin) ----------
+@app.route("/api/examples", methods=["GET"])
+def examples_list():
+    items = Example.query.order_by(Example.created_at.asc()).all()
+    return jsonify({"items": [e.as_dict() for e in items], "count": len(items)})
+
+# ---------- Log ingest/list ----------
+@app.route("/api/log/ingest", methods=["POST"])
+def log_ingest():
+    d = request.get_json(force=True) or {}
+    q = (d.get("question") or "").strip()
+    a = (d.get("answer") or "").strip()
+    if not q:
+        return jsonify({"error": "question is required"}), 400
+    qa = QAPair(question=q, answer=a, status=d.get("status", "active"))
+    db.session.add(qa)
+    db.session.commit()
+    return jsonify({"ok": True, "qa": qa.as_dict()}), 201
+
+@app.route("/api/log", methods=["GET"])
+def log_list():
+    include_ex = str(request.args.get("include_excluded", "0")) == "1"
+    limit = int(request.args.get("limit", "50"))
+    q = QAPair.query
+    if not include_ex:
+        q = q.filter(QAPair.is_excluded == False)  # noqa: E712
+    items = q.order_by(QAPair.created_at.desc()).limit(limit).all()
+    return jsonify({"items": [it.as_dict() for it in items], "count": len(items), "limit": limit})
+
+# ---------- Log actions ----------
+@app.route("/api/log/<int:qa_id>/action", methods=["PATCH"])
+def log_action(qa_id: int):
+    d = request.get_json(force=True) or {}
+    action = (d.get("action") or "").strip().lower()
+    qa = QAPair.query.get(qa_id)
+    if not qa:
+        return jsonify({"error": "not_found"}), 404
+
+    if action == "queue":
+        if qa.is_excluded:  # locked/sensitive/etc.
+            return jsonify({"error": "excluded_item"}), 400
+        qa.status = "queued"
+        db.session.commit()
+        return jsonify({"ok": True, "message": "Queued", "qa": qa.as_dict()})
+
+    if action == "restore":
+        qa.status = "restored"
+        db.session.commit()
+        return jsonify({"ok": True, "message": "Restored", "qa": qa.as_dict()})
+
+    if action == "archive":
+        qa.status = "archived"
+        db.session.commit()
+        archive_append(qa)
+        return jsonify({"ok": True, "message": "Archived", "qa": qa.as_dict()})
+
+    if action == "delete":
+        qa.status = "deleted"
+        db.session.commit()
+        return jsonify({"ok": True, "message": "Deleted", "qa": qa.as_dict()})
+
+    if action == "send_to_loop2":
+        qa.status = "in_loop2"
+        db.session.commit()
+        return jsonify({
+            "ok": True,
+            "message": "Sent to Loop2",
+            "qa": qa.as_dict(),
+            "loop2_prefill": {"box1": qa.question, "box2": qa.answer, "box3": qa.answer}
+        })
+
+    return jsonify({"error": "unknown_action"}), 400
+
+# ---------- Review Queue (status='queued') ----------
+@app.route("/api/review-queue", methods=["GET"])
+def review_queue():
+    items = QAPair.query.filter(QAPair.status == "queued").order_by(QAPair.created_at.asc()).all()
+    return jsonify({"items": [it.as_dict() for it in items], "count": len(items)})
+
+# ---------- Corpus (list + upload) ----------
+@app.route("/api/corpus", methods=["GET"])
+def corpus_list():
+    files = []
+    for name in sorted(os.listdir(CORPUS_DIR)):
+        p = os.path.join(CORPUS_DIR, name)
+        if os.path.isfile(p):
+            files.append({"name": name, "size": os.path.getsize(p)})
+    return jsonify({"items": files, "count": len(files)})
+
+@app.route("/api/corpus/upload", methods=["POST"])
+def corpus_upload():
+    if 'file' not in request.files:
+        return jsonify({"error": "no file"}), 400
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({"error": "empty filename"}), 400
+    name = secure_filename(f.filename)
+    dest = os.path.join(CORPUS_DIR, name)
+    f.save(dest)
+    return jsonify({"ok": True, "file": name, "size": os.path.getsize(dest)})
+
+
+# ---------- Examples: simple matcher ----------
+@app.route("/api/examples/match", methods=["GET"])
+def examples_match():
+    """Return the best matching Example for a given query ?q=..."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"matched": False, "reason": "missing_query"}), 400
+
+    # naive scoring: exact (case-insensitive) > substring > fuzzy-ish token overlap
+    cand = None
+    best = -1
+
+    def score(text):
+        text_l = (text or "").lower()
+        ql = q.lower()
+        if text_l == ql:
+            return 1000
+        if ql in text_l:
+            return 500
+        # token overlap
+        qs = set(t for t in ql.replace("?"," ").split() if t)
+        ts = set(t for t in text_l.replace("?"," ").split() if t)
+        if not qs or not ts:
+            return 0
+        return 100 + len(qs & ts)
+
+    items = Example.query.order_by(Example.created_at.asc()).all()
+    for e in items:
+        sc = score(e.primary_question or "")
+        if sc > best:
+            best = sc
+            cand = e
+
+    if not cand or best <= 0:
+        return jsonify({"matched": False, "reason": "no_match", "query": q, "count": len(items)})
+
+    return jsonify({
+        "matched": True,
+        "query": q,
+        "example": cand.as_dict()
+    })
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5057, debug=False)

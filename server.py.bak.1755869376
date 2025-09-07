@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+Tullman.ai Tuner API — full 7-step flow
+
+Endpoints:
+  GET  /                 -> serve ceo_llm_tuner.html if present
+  GET  /health           -> corpus counts, fts flag
+  GET  /library          -> slim list of corpus items (for dashboard table)
+  POST /ask              -> 7-step pipeline (JSON->Tullman web->general web->Kenifier->Markdown)
+
+Env (optional):
+  OPENAI_API_KEY, OPENAI_MODEL=gpt-4o-mini
+  BING_API_KEY (if SEARCH_ENGINE=bing), SEARCH_ENGINE=bing|duckduckgo (default bing if BING_API_KEY set)
+  TULLMAN_SITES=howardtullman.com,inc.com  (comma list)
+"""
+
+from flask import Flask, jsonify, request, send_from_directory
+from pathlib import Path
+import json, os, re, sqlite3, unicodedata, time
+from typing import List, Dict, Tuple, Optional
+import requests
+from bs4 import BeautifulSoup
+
+# ----- Paths -----
+BASE = Path.home() / "tullman"
+FRONTEND = BASE / "frontend"
+DATA = BASE / "data"
+CONTENT_JSONL = DATA / "content" / "content.jsonl"
+FTS_DB = DATA / "content" / "content.db"
+VOICE_SEED = BASE / "voiceprint_seed.jsonl"
+RULES_YAML = DATA / "rules.yaml"
+
+# ----- App -----
+app = Flask(__name__)
+
+# =========================
+# Basic helpers
+# =========================
+def iter_jsonl(path: Path, limit: Optional[int] = None) -> List[Dict]:
+    if not path.exists():
+        return []
+    out: List[Dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+                if limit and len(out) >= limit:
+                    break
+            except Exception:
+                pass
+    return out
+
+def normalize(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if ord(ch) < 0x0300).lower()
+
+def apply_tone_local(md: str) -> str:
+    md = re.sub(r"\b(might|maybe|perhaps|likely|it seems)\b", "", md, flags=re.I)
+    md = md.replace("—", "-")
+    return re.sub(r"\s{2,}", " ", md).strip()
+
+def read_voice_seed() -> List[str]:
+    out=[]
+    if VOICE_SEED.exists():
+        for line in iter_jsonl(VOICE_SEED, limit=50):
+            if isinstance(line, dict) and "excerpt" in line:
+                out.append(str(line["excerpt"]))
+            elif isinstance(line, str):
+                out.append(line)
+    return out[:10]
+
+# =========================
+# FTS helpers (BM25)
+# =========================
+def fts_available() -> bool:
+    return FTS_DB.exists()
+
+def build_match(q: str) -> str:
+    qn = normalize(q)
+    words = re.findall(r"[a-zA-Z]{3,}", qn)
+    phrases: List[str] = []
+    # simple phrase expansions (add more if you like)
+    if "lycee" in qn and "francais" in qn:
+        phrases += ['"lycee francais"', '"lycee français"', '"lycée francais"', '"lycée français"']
+    # user quoted phrases
+    for m in re.findall(r'"([^"]+)"', q):
+        ph = normalize(m).strip()
+        if ph: phrases.append(f'"{ph}"')
+    terms: List[str] = []
+    expand = {"lycee":["lycee","lycée"], "francais":["francais","français"]}
+    for w in words:
+        terms += expand.get(w,[w])
+    # dedupe keep order
+    seen=set(); terms=[t for t in terms if not (t in seen or seen.add(t))]
+    return " OR ".join(terms + phrases) if (terms or phrases) else "*"
+
+def fts_query(q: str, k:int=5) -> List[sqlite3.Row]:
+    con = sqlite3.connect(str(FTS_DB)); con.row_factory = sqlite3.Row
+    rows = con.execute(
+        """SELECT title,source_name,source_type,part,text,bm25(content) AS score
+           FROM content WHERE content MATCH ? ORDER BY score LIMIT ?""",
+        (build_match(q), k*4)
+    ).fetchall()
+    con.close()
+    return rows
+
+def score_keywords(text: str, terms:set[str]) -> int:
+    t=(text or "").lower()
+    return sum(t.count(w) for w in terms if w)
+
+# =========================
+# Coalescer (clean excerpts)
+# =========================
+SENT_SPLIT = re.compile(r'(?<=[.!?])\s+')
+def chunk_index(part: Optional[str]) -> int:
+    if not part: return 0
+    m = re.search(r'(\d+)$', part); return int(m.group(1)) if m else 0
+
+def _looks_like_sentence_start(s:str)->bool:
+    s=s.lstrip()
+    return bool(re.match(r'^[\"“\(\'\[]?[A-Z0-9]', s)) and not s.startswith("’")
+
+def coalesce_snippets(rows: List[Dict], max_sent:int=12, max_chars:int=1400) -> Tuple[str,List[Dict]]:
+    if not rows: return "", []
+    same_src=False
+    if len(rows)>=2:
+        n0=(rows[0].get("source_name") or "").lower()
+        same_src=all((r.get("source_name") or "").lower()==n0 for r in rows)
+    ordered = sorted(rows, key=lambda r: chunk_index(r.get("part"))) if same_src else rows
+    accepted: List[str]=[]; seen=set(); merged_lower=""
+    for r in ordered:
+        txt=(r.get("text") or "").strip().replace("\n"," ")
+        for s in [re.sub(r"\s+"," ", s).strip() for s in SENT_SPLIT.split(txt)]:
+            if not s: continue
+            if not accepted and not _looks_like_sentence_start(s): continue
+            key=s.lower()
+            if key in seen or (len(merged_lower)>=50 and key in merged_lower): continue
+            seen.add(key); accepted.append(s); merged_lower=(merged_lower+" "+key).strip()
+            if len(accepted)>=max_sent: break
+        if len(accepted)>=max_sent: break
+    merged=' '.join(accepted).strip()
+    if len(merged)>max_chars: merged=merged[:max_chars].rsplit(' ',1)[0].strip()
+    return merged, ordered
+
+# =========================
+# Web search + fetch
+# =========================
+SEARCH_ENGINE = os.getenv("SEARCH_ENGINE","bing").lower()
+BING_API_KEY = os.getenv("BING_API_KEY","")
+TULLMAN_SITES = [s.strip() for s in os.getenv("TULLMAN_SITES","howardtullman.com,inc.com").split(",") if s.strip()]
+UA = "Mozilla/5.0 (TullmanAI/1.0; +https://example.com)"
+
+def search_bing(query:str, site_filter:Optional[str]=None, top:int=5)->List[Dict]:
+    if not BING_API_KEY: return []
+    q=query
+    if site_filter: q=f"site:{site_filter} {query}"
+    url="https://api.bing.microsoft.com/v7.0/search"
+    r=requests.get(url, headers={"Ocp-Apim-Subscription-Key":BING_API_KEY}, params={"q":q,"count":top,"mkt":"en-US"}, timeout=8)
+    r.raise_for_status()
+    items=[]
+    for it in r.json().get("webPages",{}).get("value",[]):
+        items.append({"name":it.get("name"),"url":it.get("url"),"snippet":it.get("snippet","")})
+    return items
+
+def search_duckduckgo(query:str, site_filter:Optional[str]=None, top:int=5)->List[Dict]:
+    q=query
+    if site_filter: q=f"site:{site_filter} {query}"
+    url="https://duckduckgo.com/html/"
+    r=requests.post(url, data={"q":q}, headers={"User-Agent":UA}, timeout=8)
+    soup=BeautifulSoup(r.text,"lxml")
+    items=[]
+    for a in soup.select(".result__a")[:top]:
+        href=a.get("href")
+        txt=a.get_text(" ", strip=True)
+        if href and txt:
+            items.append({"name":txt, "url":href, "snippet":""})
+    return items
+
+def search_web(query:str, prefer_tullman:bool=True, top:int=3)->Tuple[List[Dict],bool]:
+    """Return list of {name,url} and a flag if any are Tullman sites."""
+    results=[]
+    is_tull=False
+    engine = "bing" if (SEARCH_ENGINE=="bing" and BING_API_KEY) else "duckduckgo"
+    # First pass: Tullman sites
+    if prefer_tullman:
+        for site in TULLMAN_SITES:
+            try:
+                hits = search_bing(query, site, top) if engine=="bing" else search_duckduckgo(query, site, top)
+                results.extend(hits)
+            except Exception:
+                continue
+        is_tull = len(results)>0
+    # Second pass: general web if nothing found
+    if not results:
+        try:
+            hits = search_bing(query, None, top) if engine=="bing" else search_duckduckgo(query, None, top)
+            results.extend(hits)
+        except Exception:
+            pass
+    return results[:top], is_tull
+
+def fetch_article(url:str, max_chars:int=6000)->str:
+    try:
+        r=requests.get(url, headers={"User-Agent":UA}, timeout=10)
+        r.raise_for_status()
+        soup=BeautifulSoup(r.text,"lxml")
+        for t in soup(["script","style","noscript"]): t.decompose()
+        text=soup.get_text(" ", strip=True)
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+# =========================
+# Kenifier (rewrite to Markdown)
+# =========================
+def kenify_markdown(prompt:str, woven_text:str, sources:List[Dict]) -> str:
+    """Use OpenAI if available; else fallback to a local markdown formatter."""
+    api_key=os.getenv("OPENAI_API_KEY","")
+    model=os.getenv("OPENAI_MODEL", "gpt-5-thinking")
+    seed=read_voice_seed()
+
+    if api_key:
+        try:
+            import openai
+            openai.api_key=api_key
+            src_md = "\n".join([f"- [{s.get('title') or s.get('url','link')}]({s.get('url','#')})" for s in sources if s.get("url")])
+            sys = ("Rewrite the content in the user's exact voice. Be direct, grounded, concise. "
+                   "Return clean Markdown: short intro, clear bullets/sections, and a Sources list if provided. "
+                   "Avoid hedging and em dashes.")
+            if seed:
+                sys += "\n\nVOICE SEED:\n" + "\n".join(f"- {x}" for x in seed[:8])
+            user = f"PROMPT:\n{prompt}\n\nCONTENT TO WEAVE:\n{woven_text}\n\nSOURCES (links markdown):\n{src_md}"
+            resp = openai.ChatCompletion.create(
+                model=model,
+                messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+                temperature=0.3,
+            )
+            return resp["choices"][0]["message"]["content"].strip()
+        except Exception:
+            pass
+
+    # Local fallback markdown
+    lines = [f"# Answer\n\n{woven_text}\n"]
+    if sources:
+        lines.append("\n## Sources\n")
+        for s in sources:
+            title=s.get("title") or s.get("url","link")
+            url=s.get("url","#")
+            lines.append(f"- [{title}]({url})")
+    return apply_tone_local("\n".join(lines).strip())
+
+# =========================
+# Pipeline: JSON -> Tullman web -> general web -> Kenifier
+# =========================
+def retrieve_from_corpus(q:str, want_k:int=3) -> List[Dict]:
+    rows=[]
+    if fts_available():
+        hits=fts_query(q, k=want_k)
+        # prefer rows with name/title hits
+        qn=normalize(q); qwords=set(re.findall(r"[a-zA-Z]{3,}", qn))
+        ranked=[]
+        for r in hits:
+            title=normalize(r["title"]); sname=normalize(r["source_name"])
+            hit = any(w in title for w in qwords) or any(w in sname for w in qwords)
+            score=float(r["score"]) + (-2.0 if hit else 0.0)
+            ranked.append((score,r))
+        ranked.sort(key=lambda x:x[0])
+        for _,r in ranked[:want_k]:
+            rows.append({"title":r["title"],"source_name":r["source_name"],"part":r["part"],"text":r["text"]})
+    else:
+        items=iter_jsonl(CONTENT_JSONL, limit=20000)
+        qwords=set(re.findall(r"[a-zA-Z]{4,}", q.lower()))
+        hits=[]
+        for rec in items:
+            sc=score_keywords(rec.get("text",""), qwords)
+            if sc>0: hits.append((sc, rec))
+        hits.sort(key=lambda x:x[0], reverse=True)
+        for _,r in hits[:want_k]:
+            rows.append({"title":r.get("title"),"source_name":r.get("source_name"),"part":r.get("part"),"text":r.get("text")})
+    return rows
+
+def weave(q:str) -> Tuple[str,List[Dict]]:
+    """7-step weaving: JSON -> Tullman web -> general web; return woven_text + sources (with URLs when web)."""
+    # 1–2) corpus
+    corpus_rows = retrieve_from_corpus(q, want_k=3)
+    woven_text=""; sources:List[Dict]=[]
+    if corpus_rows:
+        excerpt, ordered = coalesce_snippets(corpus_rows, max_sent=10, max_chars=1200)
+        if len(excerpt) >= 300:  # good enough
+            sources = [{"title": r["title"], "source_name": r["source_name"], "part": r["part"]} for r in ordered]
+            return excerpt, sources
+
+    # 3) Tullman web
+    web_hits, found_tull = search_web(q, prefer_tullman=True, top=3)
+    texts=[]; web_sources=[]
+    if web_hits:
+        for h in web_hits[:2]:
+            txt = fetch_article(h["url"])
+            if len(txt) >= 400:
+                texts.append(txt[:3000])
+                web_sources.append({"title": h.get("name"), "url": h.get("url")})
+        if texts:
+            return " ".join(texts)[:6000], web_sources
+
+    # 4) General web
+    web_hits, _ = search_web(q, prefer_tullman=False, top=3)
+    texts=[]; web_sources=[]
+    for h in web_hits[:2]:
+        txt = fetch_article(h["url"])
+        if len(txt) >= 400:
+            texts.append(txt[:3000])
+            web_sources.append({"title": h.get("name"), "url": h.get("url")})
+    if texts:
+        return " ".join(texts)[:6000], web_sources
+
+    # 2b) fallback: weak corpus excerpt if nothing else
+    if corpus_rows:
+        excerpt, ordered = coalesce_snippets(corpus_rows, max_sent=8, max_chars=800)
+        return excerpt, [{"title": r["title"], "source_name": r["source_name"], "part": r["part"]} for r in ordered]
+    # nothing
+    return "", []
+
+# =========================
+# Routes
+# =========================
+@app.get("/")
+def home():
+    html=FRONTEND / "ceo_llm_tuner.html"
+    if html.exists(): return send_from_directory(FRONTEND, html.name)
+    return jsonify({"ok": True, "msg": "API up. Put ceo_llm_tuner.html in ~/tullman/frontend/"}), 200
+
+@app.get("/health")
+def health():
+    items = iter_jsonl(CONTENT_JSONL, limit=20000)
+    counts: Dict[str,int] = {}
+    for x in items:
+        t=x.get("source_type","unknown")
+        counts[t]=counts.get(t,0)+1
+    return jsonify({"ok": True, "total": len(items), "counts": counts, "fts": fts_available()})
+
+@app.get("/library")
+def library():
+    items = iter_jsonl(CONTENT_JSONL, limit=2000)
+    slim=[{"title":x.get("title"),"source_name":x.get("source_name"),
+           "source_type":x.get("source_type"),"part":x.get("part")} for x in items]
+    return jsonify({"total": len(items), "items": slim})
+
+@app.post("/ask")
+def ask():
+    j = request.get_json(force=True, silent=True) or {}
+    q = (j.get("prompt") or "").strip()
+    if not q: return jsonify({"answer":"Ask a question first.", "sources":[]})
+
+    # 1–5) build woven content + sources (with URLs if web)
+    woven, srcs = weave(q)
+    if not woven:
+        return jsonify({"answer":"No matching content yet.", "sources":[]})
+
+    # 6) Kenifier to Markdown
+    md = kenify_markdown(q, woven, srcs)
+
+    # 7) respond ready for follow-up
+    return jsonify({"answer": md, "sources": srcs})
+
+# Dev runner (prod uses gunicorn)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

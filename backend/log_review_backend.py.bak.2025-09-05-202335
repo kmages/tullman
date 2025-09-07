@@ -1,0 +1,216 @@
+import os, json, re
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
+from flask import Flask, request, jsonify, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event
+from sqlalchemy.dialects.sqlite import JSON as SQLITE_JSON
+
+# ----------------------------
+# Config
+# ----------------------------
+DB_PATH = os.environ.get("TULLMAN_DB_PATH", "/home/kmages/tullman/app.db")
+ARCHIVE_JSONL = os.environ.get("TULLMAN_ARCHIVE_JSONL", "/home/kmages/tullman/archive/archive.jsonl")
+CAPTURE_EXCLUDED_QUESTIONS = os.environ.get("TULLMAN_CAPTURE_EXCLUDED_QUESTIONS", "1") == "1"
+AUTO_PURGE_WEEKS: Optional[int] = int(os.environ.get("TULLMAN_AUTO_PURGE_WEEKS", "0")) or None
+FRONTEND_DIR = os.environ.get("TULLMAN_FRONTEND_DIR", "/home/kmages/tullman/frontend")
+
+Path(ARCHIVE_JSONL).parent.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
+# ----------------------------
+# Models
+# ----------------------------
+class QAPair(db.Model):
+    __tablename__ = "qa_pairs"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    date_id = db.Column(db.String(32), index=True)
+
+    question = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, default="")
+
+    user_name = db.Column(db.String(120))
+    user_email = db.Column(db.String(256))
+
+    is_locked_example = db.Column(db.Boolean, default=False)
+    triggered_by_button = db.Column(db.Boolean, default=False)
+    is_excluded = db.Column(db.Boolean, default=False)
+    excluded_reason = db.Column(db.String(64))
+
+    # active/restored/queued/in_loop2/archived/deleted
+    status = db.Column(db.String(32), default="active", index=True)
+    source = db.Column(db.String(64))
+
+    matched_example_id = db.Column(db.Integer, db.ForeignKey("examples.id"))
+    matched_example = db.relationship("Example", backref="qa_refs")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "date_id": self.date_id,
+            "created_at": self.created_at.isoformat() + "Z",
+            "question": self.question,
+            "answer": self.answer,
+            "user_name": self.user_name,
+            "user_email": self.user_email,
+            "is_locked_example": self.is_locked_example,
+            "triggered_by_button": self.triggered_by_button,
+            "is_excluded": self.is_excluded,
+            "excluded_reason": self.excluded_reason,
+            "status": self.status,
+            "source": self.source,
+            "matched_example_id": self.matched_example_id,
+        }
+
+class ReviewQueue(db.Model):
+    __tablename__ = "review_queue"
+    id = db.Column(db.Integer, primary_key=True)
+    qa_id = db.Column(db.Integer, db.ForeignKey("qa_pairs.id"), unique=True, index=True, nullable=False)
+    enqueued_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    qa = db.relationship("QAPair", backref="review_item", uselist=False)
+
+class Example(db.Model):
+    __tablename__ = "examples"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    label = db.Column(db.String(200))
+    primary_question = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, nullable=False)
+    aliases = db.Column(SQLITE_JSON, default=list)
+    active = db.Column(db.Boolean, default=True)
+    locked = db.Column(db.Boolean, default=True)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "created_at": self.created_at.isoformat() + "Z",
+            "updated_at": self.updated_at.isoformat() + "Z" if self.updated_at else None,
+            "label": self.label,
+            "primary_question": self.primary_question,
+            "answer": self.answer,
+            "aliases": self.aliases or [],
+            "active": self.active,
+            "locked": self.locked,
+        }
+
+with app.app_context():
+    db.create_all()
+
+@event.listens_for(QAPair, "after_insert")
+def set_date_id(mapper, connection, target: QAPair):
+    date_part = target.created_at.strftime("%Y-%m-%d")
+    padded = f"{target.id:06d}"
+    connection.execute(
+        QAPair.__table__.update()
+        .where(QAPair.id == target.id)
+        .values(date_id=f"{date_part}-{padded}")
+    )
+
+# ----------------------------
+# Helpers
+# -------- Admin add-on: Rules + Corpus + Review alert --------
+import os
+from pathlib import Path
+from werkzeug.utils import secure_filename
+
+RULES_PATH = os.path.expanduser('~/tullman/rules.json')
+CORPUS_DIR = os.path.expanduser('~/tullman/corpus')
+Path(CORPUS_DIR).mkdir(parents=True, exist_ok=True)
+
+@app.route("/api/rules", methods=["GET", "PUT"])
+def rules_api():
+    """GET returns {"rules": "..."}; PUT accepts {"rules":"..."} and writes to ~tullman/rules.json"""
+    if request.method == "GET":
+        try:
+            txt = ""
+            if os.path.isfile(RULES_PATH):
+                with open(RULES_PATH, "r", encoding="utf-8") as f:
+                    txt = f.read()
+            return jsonify({"rules": txt})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    # PUT
+    data = request.get_json(force=True) or {}
+    txt = (data.get("rules") or "")
+    try:
+        with open(RULES_PATH, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/review-alert", methods=["GET"])
+def review_alert():
+    """Returns {"pending": N} for queued review items."""
+    cnt = ReviewQueue.query.count() if 'ReviewQueue' in globals() else 0
+    return jsonify({"pending": cnt})
+
+ALLOWED_EXTS = {".pdf", ".docx", ".txt", ".md", ".html"}
+MAX_UPLOAD = 20 * 1024 * 1024  # 20MB
+
+@app.route("/api/corpus", methods=["GET"])
+def corpus_list():
+    files = []
+    for name in sorted(os.listdir(CORPUS_DIR)):
+        p = os.path.join(CORPUS_DIR, name)
+        if os.path.isfile(p):
+            files.append({"name": name, "size": os.path.getsize(p)})
+    return jsonify({"items": files, "count": len(files)})
+
+@app.route("/api/corpus/upload", methods=["POST"])
+def corpus_upload():
+    """multipart/form-data with field 'file'."""
+    if 'file' not in request.files:
+        return jsonify({"error":"no file"}), 400
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({"error":"empty filename"}), 400
+    name = secure_filename(f.filename)
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in ALLOWED_EXTS:
+        return jsonify({"error": f"extension {ext} not allowed"}), 400
+    # size cap (best-effort)
+    f.stream.seek(0, os.SEEK_END); size = f.stream.tell(); f.stream.seek(0)
+    if size > MAX_UPLOAD:
+        return jsonify({"error":"file too large"}), 400
+    dest = os.path.join(CORPUS_DIR, name)
+    f.save(dest)
+    return jsonify({"ok": True, "file": name, "size": os.path.getsize(dest)})
+# -------- end Admin add-on --------
+
+
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "service": "log_review_backend"})
+
+
+@app.route("/api/review-queue", methods=["GET"], endpoint="review_queue_api")
+def review_queue_api():
+    items = (db.session.query(ReviewQueue).order_by(ReviewQueue.enqueued_at.asc()).all())
+    out = []
+    for it in items:
+        qa = it.qa.as_dict()
+        qa["queued_at"] = it.enqueued_at.isoformat()+"Z"
+        out.append(qa)
+    return jsonify({"items": out, "count": len(out)})
+
+
+@app.route("/api/examples", methods=["GET"], endpoint="examples_list_api")
+def examples_list_api():
+    items = Example.query.order_by(Example.created_at.asc()).all()
+    return jsonify({"items": [e.as_dict() for e in items], "count": len(items)})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5057, debug=False)

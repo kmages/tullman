@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+URL="https://tullman.ai/chat"
+HDR='Content-Type: application/json'
+PY="/home/kmages/tullman/venv/bin/python3"
+SIDFILE=/tmp/howard_sid.txt
+
+# usage: hq [-n] <question...>   (-n = new session)
+if [[ "${1:-}" == "-n" ]]; then : > "$SIDFILE"; shift; fi
+Q="${*:-}"; [[ -z "$Q" ]] && { echo "Usage: hq [-n] <question>"; exit 1; }
+
+SID=""; [[ -f "$SIDFILE" ]] && SID=$(<"$SIDFILE")
+
+make_body() {
+  "$PY" -c '
+import sys,json
+q, sid = sys.argv[1], sys.argv[2]
+p={"prompt":q,"public":True}
+if sid: p["session_id"]=sid
+print(json.dumps(p))
+' "$Q" "${SID:-}"
+}
+
+TMPB=$(mktemp) ; TMPH=$(mktemp)
+CODE=$(curl -sS -o "$TMPB" -D "$TMPH" -w '%{http_code}' -H "$HDR" -d "$(make_body)" "$URL" || echo "curl_err")
+CTYPE=$(grep -i '^content-type:' "$TMPH" | tr -d '\r' | awk '{print tolower($0)}' | sed 's/content-type: *//')
+BYTES=$(wc -c < "$TMPB" | tr -d ' ')
+
+if [[ "$CODE" == "200" ]] && echo "${CTYPE:-}" | grep -q 'application/json' && [[ "$BYTES" -gt 0 ]]; then
+  # pretty print JSON (no f-strings)
+  "$PY" -c '
+import sys,json
+d=json.load(sys.stdin)
+sid=d.get("session_id") or ""
+ans=(d.get("answer") or "").strip()
+src=d.get("sources") or []
+print(ans)
+if src:
+    print("\n-- Links --")
+    for s in src:
+        t=(s.get("title") or s.get("url") or "").strip()
+        u=(s.get("url") or "").strip()
+        if u:
+            print("- {}  <{}>".format(t,u))
+print("\n__SID__ {}".format(sid))
+' < "$TMPB"
+
+  newsid=$("$PY" -c 'import sys,json; d=json.load(sys.stdin); print(d.get("session_id") or "")' < "$TMPB")
+  [[ -n "$newsid" ]] && echo "$newsid" > "$SIDFILE"
+else
+  echo "HTTP: $CODE | type: ${CTYPE:-unknown} | bytes: $BYTES"
+  echo "---- Headers ----"; sed -n '1,20p' "$TMPH"
+  echo "---- Body (first 400B) ----"; head -c 400 "$TMPB"; echo
+fi
+
+rm -f "$TMPB" "$TMPH"

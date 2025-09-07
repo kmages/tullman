@@ -1,0 +1,136 @@
+from pathlib import Path
+
+from app import policy, intent
+# exact strategy text (ASCII only)
+STRATEGY_MD = (
+    "You need an AI strategy because it **compounds advantage**: faster cycles, broader coverage, consistent quality, "
+    "and a learning loop from your own work. Teams that start now will out-execute everyone else.\n\n"
+    "**What it does for you today**\n"
+    "- **Speed:** proposals, summaries, answers in seconds, not hours.\n"
+    "- **Coverage:** your \"always-on\" teammate that never forgets.\n"
+    "- **Consistency:** best-practice answers every time.\n"
+    "- **Leverage:** the same headcount ships more; people focus on higher-value work.\n"
+    "- **Learning:** every interaction improves the system.\n\n"
+    "**How to start (no theater)**\n"
+    "1) Pick **one painful, repeatable** process (support triage, proposal drafts, internal search).\n"
+    "2) Build a **human-in-the-loop** assist in **10-14 days**.\n"
+    "3) **Instrument** it (baseline vs. assisted): cycle time, quality, resolution rate.\n"
+    "4) If it wins, **scale** and make it habit; if not, **kill it** and try the next use case.\n\n"
+    "**Guardrails I insist on**\n"
+    "- **Truth > fluency:** retrieve and **cite**; don't guess.\n"
+    "- **Privacy & IP:** keep sensitive data inside your walls; log access.\n"
+    "- **Clear owners & metrics:** a real dashboard, not anecdotes.\n"
+    "- **Change mgmt:** train people; reward usage, not demos.\n\n"
+    "**30/60/90**\n"
+    "- **30 days:** 1 live assist + dashboard you trust.\n"
+    "- **60 days:** 2 more use cases; partial automation where precision is proven.\n"
+    "- **90 days:** lightweight governance, internal training, and a backlog of the next five.\n\n"
+    "**Bottom line**\n"
+    "AI isn't a someday project. **Start tiny. Ship this quarter. Measure. Scale what works.** "
+    "I'll help you keep the process honest and focused on outcomes."
+)
+
+REFLECTIVE_SKELETONS = {
+  "define success": "Success is sustained impact: useful outcomes shipped on time, with integrity, that compound over years.",
+  "chasing goals":  "People forget the baseline and the cost — without a baseline you cannot prove progress; without a cost you will not focus.",
+  "kindness":       "Kindness compounds: it lowers friction, increases trust, and keeps teams resilient when things break.",
+  "free will":      "We have agency inside constraints; choices compound and become character.",
+  "afterlife":      "I believe in legacy here: what we build, the people we grow, and the work that outlasts us.",
+}
+
+def strip_greeting(text: str) -> str:
+    if not isinstance(text, str): return text
+    t = text.lstrip(); low = t.lower()
+    if not low.startswith("hi") or "howard t" not in low[:80]: return text
+    i = low.find("howard t"); j = i + len("howard tullman") if i!=-1 else 0
+    k = j
+    while 0 <= k < len(t) and (t[k] in ".! " or ord(t[k]) in (45,8211,8212)):
+        k += 1
+    return t[k:].lstrip()
+
+def finalize(prompt: str, md: str, links: list) -> tuple[str, list]:
+    # global cleanup + chips policy
+    t = (md or "").strip()
+    t = strip_greeting(t)
+    if t.startswith("Tullman."): t = t[len("Tullman."):].lstrip()
+    t = t.replace("founded or ran", "founded and ran")
+    # dedupe old generic line tail if present
+    t = t.replace("keep what beats baseline.-we'll ship one small win this quarter and scale the ones that work.", "keep what beats baseline.")
+    links = policy.filter_links(prompt, links or [], max_links=2)
+    return t, links
+
+# handlers
+def handle_strategy(prompt: str, prior: str) -> tuple[str,list]:
+    # links are optional; show only if relevant
+    return STRATEGY_MD, []
+
+def handle_bio(prompt: str, prior: str) -> tuple[str,list]:
+    # delegate to existing composer for bio
+    from app.composer import compose
+    md, links = compose(prompt, public=True, prior=prior)
+    return md, links
+
+def handle_kendall(prompt: str, prior: str) -> tuple[str,list]:
+    base = (
+      "At Kendall College I focused on execution and employability. We moved to a modern Goose Island campus and "
+      "built industry-grade facilities; doubled down on culinary/hospitality and job-ready curricula; wired in "
+      "employer partnerships, internships, and real projects so students shipped work; and imposed operating "
+      "discipline with clear, measurable outcomes. The goal wasn\'t theater—graduates who contribute on day one and a "
+      "school that sustains itself."
+    )
+    try:
+        from app.composer import _gpt_rewrite
+        md = _gpt_rewrite(prompt, base, prior, []) or base
+    except Exception:
+        md = base
+    bad = "I focus on execution, not theater" in md or md.strip().lower().startswith("tell me the outcome")
+    if bad:
+        md = base
+    return md, []
+
+def handle_reflective(prompt: str, prior: str) -> tuple[str,list]:
+    q=(prompt or "").lower()
+    md = None
+    for k, v in REFLECTIVE_SKELETONS.items():
+        if k in q:
+            md = v; break
+    if md is None:
+        md = "Here is my view in one sentence, then a short rationale with 2-3 bullets."
+    try:
+        from app.composer import _gpt_rewrite
+        polished = _gpt_rewrite(prompt, md, prior, []) or md
+    except Exception:
+        polished = md
+    generic = ("Here is my view in one sentence" in polished) or polished.strip().lower().startswith("tell me the outcome")
+    final = md if generic else polished
+    return final, []
+
+def handle_opinion_israel(prompt: str, prior: str) -> tuple[str,list]:
+    md = ("### Israel — my view\n"
+          "**Position:** Israel must be secure and democratic; terror is unacceptable; Palestinian civilians matter.\n"
+          "**Why:** safety of citizens, rule of law, and a realistic path that reduces violence.\n"
+          "**Red lines:** terror, antisemitism, and collective punishment.\n"
+          "**Progress looks like:** concrete steps that lower violence, increase freedom, and build trust.")
+    return md, []
+
+def handle_generic(prompt: str, prior: str) -> tuple[str,list]:
+    from app.composer import compose
+    return compose(prompt, public=True, prior=prior)
+
+HANDLERS = {
+    "strategy":       handle_strategy,
+    "bio":            handle_bio,
+    "kendall":        handle_kendall,
+    "reflective":     handle_reflective,
+    "opinion_israel": handle_opinion_israel,
+}
+
+def answer(prompt: str, prior: str) -> tuple[str, list]:
+    # route
+    for pred, name in intent.ROUTES:
+        if pred(prompt):
+            md, links = HANDLERS.get(name, handle_generic)(prompt, prior)
+            return finalize(prompt, md, links)
+    # default
+    md, links = handle_generic(prompt, prior)
+    return finalize(prompt, md, links)

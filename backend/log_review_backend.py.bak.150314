@@ -1,0 +1,169 @@
+import os, json
+from datetime import datetime
+from pathlib import Path
+from flask import Flask, request, jsonify, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event
+from sqlalchemy.dialects.sqlite import JSON as SQLITE_JSON
+
+DB_PATH = "/home/kmages/tullman/app.db"
+FRONTEND_DIR = "/home/kmages/tullman/frontend"
+ARCHIVE_JSONL = "/home/kmages/tullman/archive/archive.jsonl"
+Path(ARCHIVE_JSONL).parent.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
+class QAPair(db.Model):
+    __tablename__ = "qa_pairs"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    date_id = db.Column(db.String(32), index=True)
+    question = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, default="")
+    is_locked_example = db.Column(db.Boolean, default=False)
+    triggered_by_button = db.Column(db.Boolean, default=False)
+    is_excluded = db.Column(db.Boolean, default=False)
+    excluded_reason = db.Column(db.String(64))
+    status = db.Column(db.String(32), default="active", index=True)
+    source = db.Column(db.String(64))
+    matched_example_id = db.Column(db.Integer, db.ForeignKey("examples.id"))
+    matched_example = db.relationship("Example", backref="qa_refs")
+    def as_dict(self):
+        return {"id": self.id, "date_id": self.date_id, "created_at": self.created_at.isoformat()+"Z",
+                "question": self.question, "answer": self.answer,
+                "is_locked_example": self.is_locked_example, "triggered_by_button": self.triggered_by_button,
+                "is_excluded": self.is_excluded, "excluded_reason": self.excluded_reason,
+                "status": self.status, "source": self.source, "matched_example_id": self.matched_example_id}
+
+class ReviewQueue(db.Model):
+    __tablename__ = "review_queue"
+    id = db.Column(db.Integer, primary_key=True)
+    qa_id = db.Column(db.Integer, db.ForeignKey("qa_pairs.id"), unique=True, index=True, nullable=False)
+    enqueued_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    qa = db.relationship("QAPair", backref="review_item", uselist=False)
+
+class Example(db.Model):
+    __tablename__ = "examples"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    label = db.Column(db.String(200))
+    primary_question = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, nullable=False)
+    aliases = db.Column(SQLITE_JSON, default=list)
+    active = db.Column(db.Boolean, default=True)
+    locked = db.Column(db.Boolean, default=True)
+    def as_dict(self):
+        return {"id": self.id, "created_at": self.created_at.isoformat()+"Z",
+                "updated_at": self.updated_at.isoformat()+"Z" if self.updated_at else None,
+                "label": self.label, "primary_question": self.primary_question,
+                "answer": self.answer, "aliases": self.aliases or [],
+                "active": self.active, "locked": self.locked}
+
+with app.app_context():
+    db.create_all()
+
+@event.listens_for(QAPair, "after_insert")
+def set_date_id(mapper, connection, target: QAPair):
+    date_part = target.created_at.strftime("%Y-%m-%d")
+    connection.execute(
+        QAPair.__table__.update()
+        .where(QAPair.id == target.id)
+        .values(date_id=f"{date_part}-{target.id:06d}")
+    )
+
+# ----- Sensitive denylist -----
+SENSITIVE_QA = [{
+    "q": "Where was Howard on 9/11?",
+    "a": "I was in my Xceed office in New York City, less than two blocks from the Twin Towers when they came down."
+}]
+def _is_sensitive(q, a):
+    qn=(q or '').strip(); an=(a or '').strip()
+    for it in SENSITIVE_QA:
+        iq=(it.get('q') or '').strip(); ia=(it.get('a') or '').strip()
+        if iq and ia and qn==iq and an==ia: return True
+        if iq and qn==iq: return True
+        if ia and an==ia: return True
+    return False
+
+# ----- Helpers -----
+def _norm(s): return (s or '').strip().lower()
+def _example_match(q):
+    nq=_norm(q)
+    if not nq: return None
+    for e in Example.query.filter(Example.active==True).all():  # noqa: E712
+        if _norm(e.primary_question)==nq: return e
+        for al in (e.aliases or []):
+            if _norm(al)==nq: return e
+    return None
+
+# ----- Health -----
+@app.route("/api/health")
+def health(): return jsonify({"ok": True, "service": "log_review_backend"})
+
+# ----- Examples: list/create -----
+@app.route("/api/examples", methods=["GET"])
+def examples_list():
+    items = Example.query.order_by(Example.created_at.asc()).all()
+    return jsonify({"items":[e.as_dict() for e in items], "count":len(items)})
+
+@app.route("/api/examples", methods=["POST"])
+def examples_create():
+    d = request.get_json(force=True) or {}
+    pq=(d.get("primary_question") or "").strip()
+    ans=(d.get("answer") or "").strip()
+    if not pq or not ans: return jsonify({"error":"primary_question and answer are required"}), 400
+    ex = Example(primary_question=pq, answer=ans, aliases=d.get("aliases") or [],
+                 label=d.get("label"), active=bool(d.get("active",True)), locked=bool(d.get("locked",True)))
+    db.session.add(ex); db.session.commit()
+    return jsonify({"ok":True,"example":ex.as_dict()}), 201
+
+# ----- Log ingest (with sensitive guard & Example lock handling) -----
+@app.route("/api/log/ingest", methods=["POST"])
+def ingest():
+    d=request.get_json(force=True) or {}
+    q=(d.get("question") or "").strip()
+    a=(d.get("answer") or "").strip()
+    if not q: return jsonify({"error":"question is required"}),400
+    matched=_example_match(q)
+    is_locked_example = bool(d.get("is_locked_example", False))
+    triggered_by_button = bool(d.get("triggered_by_button", False))
+    if matched and matched.active and matched.locked:
+        is_locked_example=True; a=matched.answer
+    excluded_reason = "locked_example" if is_locked_example else ("button_trigger" if triggered_by_button else None)
+    is_excluded = bool(excluded_reason)
+    if _is_sensitive(q,a): is_excluded=True; excluded_reason="sensitive"; a=""
+    qa = QAPair(question=q, answer=a, is_locked_example=is_locked_example,
+                triggered_by_button=triggered_by_button, is_excluded=is_excluded,
+                excluded_reason=excluded_reason, source=d.get("source","front_page"),
+                matched_example_id=matched.id if matched else None)
+    db.session.add(qa); db.session.commit()
+    return jsonify({"ok":True,"qa":qa.as_dict()}),201
+
+# ----- Log list (newest-first) -----
+@app.route("/api/log", methods=["GET"])
+def log_list():
+    items = QAPair.query.filter(QAPair.is_excluded == False).order_by(QAPair.created_at.desc()).limit(100).all()  # noqa: E712
+    return jsonify({"items":[it.as_dict() for it in items], "count":len(items), "limit":100, "offset":0})
+
+# ----- Minimal counters -----
+@app.route("/api/counters", methods=["GET"])
+def counters():
+    log_total = QAPair.query.filter(QAPair.is_excluded == False).count()  # noqa: E712
+    return jsonify({"review_queue": 0, "log_total": log_total, "log_today": 0})
+
+# ----- Static -----
+@app.route("/frontend/<path:path>")
+def frontend_files(path): return send_from_directory(FRONTEND_DIR, path)
+@app.route("/log")
+def log_page(): return send_from_directory(FRONTEND_DIR, "log.html")
+@app.route("/review")
+def review_page(): return send_from_directory(FRONTEND_DIR, "review.html")
+@app.route("/examples")
+def examples_page(): return send_from_directory(FRONTEND_DIR, "examples.html")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5057, debug=False)

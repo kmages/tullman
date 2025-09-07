@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Admin — Tullman.ai (Studio)</title>
+<meta name="color-scheme" content="dark light">
+<style>
+:root{--bg:#0b0f17;--text:#e8eefc;--muted:#8ea2c8;--line:#1f2a44;--card:#121826;--accent:#4ea1ff}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 system-ui,Segoe UI,Roboto,Helvetica,Arial}
+.wrap{max-width:1100px;margin:36px auto 64px;padding:0 18px}
+h1{margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+textarea,input,select{width:100%;background:#0d1320;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px}
+button{background:var(--accent);color:#001633;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+small{color:var(--muted)}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(12,1fr)}
+pre{background:#0d1320;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line);background:#0d1320;color:var(--muted);margin-left:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Admin — Tullman.ai <span id="status" class="badge">ready</span></h1>
+
+  <!-- Voice -->
+  <div class="card">
+    <h3>Voiceprint</h3>
+    <textarea id="voiceText" rows="8" placeholder="Voiceprint…"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="loadVoice">Load</button>
+      <button id="saveVoice">Save</button>
+      <small id="vmsg"></small>
+    </div>
+  </div>
+
+  <!-- Preview + Tuner -->
+  <div class="grid">
+    <div class="card" style="grid-column: span 6">
+      <h3>Preview</h3>
+      <input id="pPrompt" type="text" value="In one sentence, what is your leadership philosophy?"/>
+      <div class="row" style="margin-top:10px"><button id="runPreview">Run</button></div>
+      <label>Result</label>
+      <pre id="pOut" style="min-height:140px"></pre>
+      <div id="pSources" class="muted" style="margin-top:6px"></div>
+    </div>
+
+    <div class="card" style="grid-column: span 6">
+      <h3>Tuner (when this isn’t “Howard”)</h3>
+      <textarea id="pEdit" rows="6" placeholder="Type the corrected answer here…"></textarea>
+      <label style="margin-top:8px">Add short rules (one per line)</label>
+      <textarea id="pRules" rows="4" placeholder="Avoid saying X\nPrefer phrasing Y\nSay ‘founded and ran’, never ‘founded or ran’"></textarea>
+      <div class="row" style="margin-top:10px">
+        <select id="pDecision">
+          <option value="rewrite" selected>Rewrite (use my edit)</option>
+          <option value="not_me">Not me (log + rules only)</option>
+          <option value="ok">OK (log only)</option>
+        </select>
+        <button id="applyTune">Apply & Save</button>
+        <small id="tmsg"></small>
+      </div>
+    </div>
+  </div>
+
+  <!-- Documents -->
+  <div class="card">
+    <h3>Documents</h3>
+    <div class="row">
+      <input id="files" type="file" multiple />
+      <button id="upload">Upload</button>
+      <button id="ingest">Ingest now</button>
+      <small id="umsg"></small>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="ixTitle" type="text" placeholder="Quick index: title (e.g., Admin note)"/>
+      <textarea id="ixText" rows="3" placeholder="Paste text to append to the corpus immediately…"></textarea>
+      <button id="indexText">Index text</button>
+      <small>Goes straight into content.jsonl with tags [tullman_ai, admin]</small>
+    </div>
+  </div>
+
+  <!-- System -->
+  <div class="card">
+    <h3>System</h3>
+    <div class="row">
+      <button id="refreshHealth">Refresh stats</button>
+      <small>/health snapshot</small>
+    </div>
+    <pre id="healthOut" style="min-height:100px"></pre>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s); const status=(m)=>{$('#status').textContent=' '+m;}
+async function api(p,o){const r=await fetch(p,o); if(!r.ok) throw new Error(await r.text()||('HTTP '+r.status)); return r.json();}
+
+// Voice
+$('#loadVoice').onclick=async()=>{try{status('loading voice'); const j=await api('/admin/voiceprint'); $('#voiceText').value=j.voiceprint||''; $('#vmsg').textContent='Loaded'; status('ready');}catch(e){$('#vmsg').textContent='Error: '+e.message; status('error');}};
+$('#saveVoice').onclick=async()=>{try{status('saving'); const v=($('#voiceText').value||'').trim(); await api('/admin/voiceprint',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({voiceprint:v})}); $('#vmsg').textContent='Saved'; status('ready');}catch(e){$('#vmsg').textContent='Error: '+e.message; status('error');}};
+
+// Preview
+async function runPreview(){try{status('preview…'); const q=$('#pPrompt').value.trim(); const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:q, public:true})}); const txt=await r.text(); let j={}; try{j=JSON.parse(txt);}catch{ $('#pOut').textContent='Bad JSON: '+txt.slice(0,200); status('bad JSON'); return;} $('#pOut').textContent=(j.answer||'').trim()||'(empty)'; const src=(j.sources||[]).filter(s=>s&&s.url).map(s=>`• ${s.title||s.url} <${s.url}>`).join('\n'); $('#pSources').textContent=src||''; status('ready'); }catch(e){$('#pOut').textContent='Error: '+e.message; status('error');}}
+$('#runPreview').onclick=runPreview;
+
+// Tuner
+$('#applyTune').onclick=async()=>{try{
+  status('saving feedback…');
+  const payload={ prompt:($('#pPrompt').value||'').trim(), draft:($('#pOut').textContent||'').trim(), decision:$('#pDecision').value, edited:($('#pEdit').value||'').trim(), add_rules:($('#pRules').value||'').split(/\n+/).map(x=>x.trim()).filter(Boolean) };
+  const j=await api('/admin/tune/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  $('#tmsg').textContent = 'Saved. '+(j.final?'Regenerated.':'');
+  if (j.final){ $('#pOut').textContent=j.final; }
+  // refresh rules in UI (optional)
+} catch(e){ $('#tmsg').textContent='Error: '+e.message; status('error'); }};
+
+// Upload / ingest
+$('#upload').onclick=async()=>{try{status('uploading…'); const f=$('#files').files; if(!f.length){$('#umsg').textContent='Pick files first.'; status('ready'); return;} const fd=new FormData(); for(const x of f) fd.append('file',x); const r=await fetch('/admin/upload',{method:'POST',body:fd}); if(!r.ok) throw new Error(await r.text()); $('#umsg').textContent='Uploaded'; status('ready');}catch(e){$('#umsg').textContent='Error: '+e.message; status('error');}}
+$('#ingest').onclick=async()=>{try{status('ingest…'); await api('/admin/ingest',{method:'POST'}); $('#umsg').textContent='Ingest started'; status('ready');}catch(e){$('#umsg').textContent='Error: '+e.message; status('error');}}
+
+// Quick index text → corpus
+$('#indexText').onclick=async()=>{try{status('indexing…'); const title=$('#ixTitle').value||'admin: text', text=$('#ixText').value||''; if(!text.trim()){status('ready'); return;} await api('/admin/tune/index-text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title, text, tags:[]})}); $('#ixText').value=''; status('ready');}catch(e){status('error');}}
+
+// System
+$('#refreshHealth').onclick=async()=>{try{status('health…'); const j=await api('/health'); $('#healthOut').textContent=JSON.stringify(j,null,2); status('ready');}catch(e){$('#healthOut').textContent='Error: '+e.message; status('error');}}
+(async()=>{try{const j=await api('/health'); $('#healthOut').textContent=JSON.stringify(j,null,2);}catch(e){};})();
+</script>
+</body></html>

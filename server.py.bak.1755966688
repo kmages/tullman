@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from flask import Flask, jsonify, request, send_from_directory
+from pathlib import Path
+from collections import deque, OrderedDict
+import os, json, re, logging
+
+# normal answers come from the composer (JSON-first -> GPT -> fallback)
+from app.composer import compose
+from app.howard import answer as howard_answer
+from app.brain import answer as brain_answer
+
+# ---------- paths ----------
+BASE     = Path.home() / "tullman"
+FRONTEND = BASE / "frontend"
+ASSETS   = Path("/var/www/tullman/assets")
+DATA     = BASE / "data"
+CONTENT  = DATA / "content" / "content.jsonl"
+
+# ---------- app ----------
+app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
+
+# ---------- helpers ----------
+def _is_strategy_prompt(q: str) -> bool:
+    q = (q or "").lower()
+    # never treat bio prompts as strategy
+    if any(k in q for k in ("who is","about","bio","profile","background")):
+        return False
+    keys = ("ai strategy","need an ai strategy","why do i need an ai","ai roadmap","ai plan","ai for my business")
+    has_ai   = ("ai" in q) or ("artificial intelligence" in q)
+    has_plan = any(k in q for k in ("strategy","roadmap","plan","playbook"))
+    explicit = any(k in q for k in keys)
+    return (has_ai and has_plan) or explicit
+
+# Exact AI-strategy answer (ASCII-only)
+STRATEGY_MD = (
+    "You need an AI strategy because it **compounds advantage**: faster cycles, broader coverage, consistent quality, "
+    "and a learning loop from your own work. Teams that start now will out-execute everyone else.\n\n"
+    "**What it does for you today**\n"
+    "- **Speed:** proposals, summaries, answers in seconds, not hours.\n"
+    "- **Coverage:** your \"always-on\" teammate that never forgets.\n"
+    "- **Consistency:** best-practice answers every time.\n"
+    "- **Leverage:** the same headcount ships more; people focus on higher-value work.\n"
+    "- **Learning:** every interaction improves the system.\n\n"
+    "**How to start (no theater)**\n"
+    "1) Pick **one painful, repeatable** process (support triage, proposal drafts, internal search).\n"
+    "2) Build a **human-in-the-loop** assist in **10-14 days**.\n"
+    "3) **Instrument** it (baseline vs. assisted): cycle time, quality, resolution rate.\n"
+    "4) If it wins, **scale** and make it habit; if not, **kill it** and try the next use case.\n\n"
+    "**Guardrails I insist on**\n"
+    "- **Truth > fluency:** retrieve and **cite**; don't guess.\n"
+    "- **Privacy & IP:** keep sensitive data inside your walls; log access.\n"
+    "- **Clear owners & metrics:** a real dashboard, not anecdotes.\n"
+    "- **Change mgmt:** train people; reward usage, not demos.\n\n"
+    "**30/60/90**\n"
+    "- **30 days:** 1 live assist + dashboard you trust.\n"
+    "- **60 days:** 2 more use cases; partial automation where precision is proven.\n"
+    "- **90 days:** lightweight governance, internal training, and a backlog of the next five.\n\n"
+    "**Bottom line**\n"
+    "AI isn't a someday project. **Start tiny. Ship this quarter. Measure. Scale what works.** "
+    "I'll help you keep the process honest and focused on outcomes."
+)
+
+def strip_greeting(text: str) -> str:
+    """
+    Remove a leading 'Hi ... I’m/I'm Howard Tullman.' from the final answer (always).
+    ASCII-safe; tolerant of dashes and punctuation after the name.
+    """
+    if not isinstance(text, str): 
+        return text
+    t = text.lstrip()
+    low = t.lower()
+    if not low.startswith("hi") or "howard t" not in low[:80]:
+        return text
+    i = low.find("howard t")
+    j = i + len("howard tullman") if i != -1 else 0
+    dashes = {45, 8211, 8212}  # -, –, —
+    k = j
+    while 0 <= k < len(t):
+        ch = t[k]
+        if ch in ".! " or ord(ch) in dashes:
+            k += 1
+        else:
+            break
+    return t[k:].lstrip()
+
+def _filter_public_links(prompt: str, links: list[dict], max_links:int=2) -> list[dict]:
+    """
+    Keep Howard/Inc/Northwestern/Wikipedia AI/strategy links; drop politics/noise; clean titles; cap.
+    """
+    SAFE = ("howardtullman.com","tullman.blogspot.com","blogspot.com","inc.com","northwestern.edu","wikipedia.org")
+    EXCL = ("top toady","roberts","putin","trump","election","politic","chunk")
+    KEYW = ("ai","artificial intelligence","strategy","roadmap","plan","llm","automation","table stakes","table-stakes")
+
+    out, seen = [], set()
+    q = (prompt or "").lower()
+    for l in links or []:
+        u = (l.get("url") or "").strip()
+        if not u: 
+            continue
+        host = re.sub(r"^https?://","",u).split("/")[0].lower()
+        if not any(host.endswith(d) for d in SAFE):
+            continue
+        title = (l.get("title") or u).strip()
+        low_t = title.lower(); low_u = u.lower()
+
+        # reject politics/noise
+        if any(x in low_t for x in EXCL) or any(x in low_u for x in EXCL):
+            continue
+
+        # for clearly strategy/table-stakes asks, require AI-ish keywords
+        if any(k in q for k in ("ai strategy","table stakes","why do i need an ai","ai plan","ai roadmap")):
+            blob = f"{title} {u}".lower()
+            if not any(k in blob for k in KEYW):
+                continue
+
+        # clean title: drop trailing 'chunk N', de-shout
+        title = re.sub(r'\s*-\s*chunk\s*\d+\s*$','', title, flags=re.I)
+        title = re.sub(r'\s*chunk\s*\d+\s*$','', title, flags=re.I).strip()
+        if title and title.upper()==title:
+            title = title.title()
+
+        key = u.lower()
+        if key in seen: 
+            continue
+        seen.add(key)
+        out.append({"title": title or "Source", "url": u})
+        if len(out) >= max_links:
+            break
+    return out
+
+def _strategy_links_best(max_links:int=2) -> list[dict]:
+    """Pick up to N relevant AI/strategy links from Howard sources; titles cleaned; noise excluded."""
+    SAFE = ("howardtullman.com","tullman.blogspot.com","blogspot.com","inc.com","northwestern.edu","wikipedia.org")
+    EXCL = ("top toady","roberts","putin","trump","election","politic","chunk")
+    KEYW = ("ai","artificial intelligence","strategy","roadmap","plan","llm","automation","table stakes","table-stakes")
+    out, seen = [], set()
+    try:
+        if not CONTENT.exists():
+            return out
+        def score(u, t, x):
+            host = re.sub(r"^https?://","",u).split("/")[0].lower()
+            base = 0
+            if host.endswith("howardtullman.com"): base += 6
+            elif host.endswith("inc.com"):          base += 5
+            elif host.endswith("northwestern.edu"): base += 4
+            elif host.endswith("tullman.blogspot.com") or host.endswith("blogspot.com"): base += 3
+            blob = f"{t} {x}".lower()
+            base += sum(1 for k in KEYW if k in blob)
+            return base
+        picks = []
+        with CONTENT.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except:
+                    continue
+                u = (r.get("url") or "").strip()
+                if not u: 
+                    continue
+                host = re.sub(r"^https?://","",u).split("/")[0].lower()
+                if not any(host.endswith(d) for d in SAFE):
+                    continue
+                title = (r.get("title") or r.get("source_name") or u).strip()
+                text  = (r.get("text")  or "").strip()
+                low_t = title.lower()
+                if any(x in low_t for x in EXCL):
+                    continue
+                blob  = f"{title} {text}".lower()
+                if not any(k in blob for k in KEYW):
+                    continue
+                # clean title
+                title = re.sub(r'\s*-\s*chunk\s*\d+\s*$','', title, flags=re.I)
+                title = re.sub(r'\s*chunk\s*\d+\s*$','', title, flags=re.I).strip()
+                if title and title.upper()==title:
+                    title = title.title()
+                key = u.lower()
+                if key in seen: 
+                    continue
+                seen.add(key)
+                picks.append( (score(u,title,text), {"title": title or "Source", "url": u}) )
+        picks.sort(key=lambda x: x[0], reverse=True)
+        for _, item in picks[:max_links]:
+            out.append(item)
+        return out
+    except Exception:
+        return out
+
+# ---------- sessions ----------
+SESSIONS: "OrderedDict[str, deque[tuple[str,str]]]" = OrderedDict()
+MAX_TURNS=16
+MAX_SESS =200
+def get_session(sid: str | None):
+    sid = sid or os.urandom(16).hex()
+    sess = SESSIONS.get(sid)
+    if sess is None:
+        sess = deque(maxlen=MAX_TURNS); SESSIONS[sid]=sess
+        if len(SESSIONS)>MAX_SESS: SESSIONS.popitem(last=False)
+    else:
+        SESSIONS.move_to_end(sid)
+    return sid, sess
+
+# ---------- routes ----------
+
+def _finalize_answer(prompt: str, md: str, links: list[dict]) -> tuple[str, list[dict]]:
+    """Last-mile cleanup: strip greeting, remove fragments, dedupe fallback, fix list formatting, filter chips."""
+    import re as _re
+
+    t = md or ""
+    # 1) strip greeting and any orphaned "Tullman."
+    t = strip_greeting(t)
+    t = _re.sub(r'^\s*Tullman\.\s*', '', t)
+
+    # 2) dedupe the old+new fallback line (keep the stronger one)
+    #    ...keep what beats baseline.-we'll ship one small win...
+    t = _re.sub(
+        r'(keep what beats baseline\.)\s*[–-]?\s*we[’\']?ll ship one small win this quarter and scale the ones that work\.',
+        r'\1',
+        t, flags=_re.I
+    )
+
+    # 3) ensure newline before numbered list after a bold header
+    t = _re.sub(r'(\*\*How to start[^\n]*\*\*)\s*(?=1\))', r'\\1\n', t)
+
+    # 4) tighten whitespace
+    t = _re.sub(r'[ \t]+', ' ', t)
+    t = _re.sub(r'\n{3,}', '\n\n', t).strip()
+
+    # 5) context-aware chip filter (if present)
+    try:
+        links = _filter_public_links(prompt, links, max_links=2)
+    except Exception:
+        links = links or []
+
+    # 6) one phrasing we always normalize
+    t = t.replace("founded or ran", "founded and ran")
+    return t, links
+
+@app.get("/health")
+def health():
+    counts={}
+    if CONTENT.exists():
+        with CONTENT.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    j=json.loads(line)
+                    t=j.get("source_type","unknown")
+                    counts[t]=counts.get(t,0)+1
+                except:
+                    pass
+    return jsonify({"ok": True, "total": sum(counts.values()), "counts": counts})
+
+@app.get("/assets/<path:fname>")
+def assets(fname):
+    return send_from_directory(ASSETS, fname)
+
+@app.get("/")
+def home():
+    html = FRONTEND / "public.html"
+    if html.exists(): return send_from_directory(html.parent, html.name)
+    return jsonify({"ok": True, "msg": "Public page missing"}), 200
+
+
+
+def _kendall_answer() -> str:
+    return (
+        "At Kendall College I focused on execution and employability. We moved to a modern Goose Island campus and "
+        "built industry-grade facilities; doubled down on **culinary/hospitality** and job-ready curricula; wired in "
+        "employer partnerships, internships, and real projects so students shipped work; and imposed operating "
+        "discipline with clear, measurable outcomes. The goal wasn’t theater — it was graduates who could contribute "
+        "on day one and a school that could sustain itself."
+    )
+
+
+
+
+@app.post("/chat")
+def chat():
+    """
+    Unified path: allocate sid/prior, delegate to howard pipeline, then return JSON.
+    """
+    try:
+        j = request.get_json(force=True, silent=True) or {}
+        q = (j.get("prompt") or "").strip()
+        sid, hist = get_session(j.get("session_id"))
+        prior = " ".join(f"{r}: {c}" for r, c in list(hist)[-8:])
+        if not q:
+            return jsonify({"session_id": sid, "answer": "Ask a question first.", "sources": []})
+
+        md, links = howard_answer(q, prior)
+
+        # pass through finalizer/chip policy if available
+        try:
+            md, links = _finalize_answer(q, md, links)
+        except Exception:
+            pass
+
+        hist.append(("user", q)); hist.append(("assistant", md)))
+        return jsonify({"session_id": sid, "answer": md, "sources": links})
+    except Exception:
+        try: app.logger.exception("chat_error")
+        except Exception: pass
+        return jsonify({"session_id": j.get("session_id") if isinstance(j, dict) else None,
+                        "answer": "Sorry - server error. Please try again.", "sources": []}), 500
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+
+
+def _is_reflective_prompt(q: str) -> bool:
+    q = (q or "").lower()
+    keys = (
+        "define success","success",
+        "forget when chasing goals","chasing goals",
+        "kindness","boldest opinion","fear of death","afterlife",
+        "free will","misunderstood about you","irrational belief",
+        "stay grounded","secret fuel","unshakable belief","core trait",
+        "need to hear more often","solitude","true love","chemistry"
+    )
+    return any(k in q for k in keys)
+
+REFLECTIVE_SKELETONS = {
+    "define success": "Success is sustained impact: useful outcomes shipped on time, with integrity, that compound over years.",
+    "chasing goals":  "People forget the baseline and the cost — without a baseline you can’t prove progress; without a cost you won’t focus.",
+    "kindness":       "Kindness compounds: it lowers friction, increases trust, and keeps teams resilient when things break.",
+    "free will":      "We have agency inside constraints; choices compound and become character.",
+    "afterlife":      "I believe in legacy here: what we build, the people we grow, and the work that outlasts us."
+}
+
+def _reflective_answer(prompt: str) -> str:
+    q = (prompt or "").lower()
+    for k, v in REFLECTIVE_SKELETONS.items():
+        if k in q:
+            return v
+    # default, still question-first and on-voice
+    return "Here’s my view in one sentence, then a short rationale with 2–3 bullets."

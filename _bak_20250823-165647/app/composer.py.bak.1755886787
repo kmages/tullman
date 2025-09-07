@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from pathlib import Path
+from collections import OrderedDict
+import os, re, json, unicodedata, requests
+from bs4 import BeautifulSoup
+
+BASE     = Path.home() / "tullman"
+DATA     = BASE / "data"
+CONTENT  = DATA / "content" / "content.jsonl"
+UA       = "Mozilla/5.0 (TullmanAI/1.0)"
+WIKI_URL = "https://en.wikipedia.org/wiki/Howard_A._Tullman"
+
+# Public JSON filter: exclude email/“Just Ken”/ceremony/speech content
+BAD_TERMS  = {'gmail','my thoughts','kmages','ken mages','avatarbuddy','trincity','eyelevel','just ken','newsletter','on infinity',
+              'graduation','commencement','committee','illinois tech','illinois institute of technology','ceremony','speech',
+              'i want to thank','honored to','suzanne','jb ',' jai ',' tom alexander','lakshmi shenoy','laura clark','jeanne reidy',
+              'diana lopez','claudia saric'}  # common speech names/phrases
+GOOD_HINTS = {'tullman','howard tullman','hat ',' 1871 ','kendall college','tribeca flashpoint','chicagoland entrepreneurial center'}
+
+# Public answers only show links from these domains
+SAFE_DOMAINS = {'howardtullman.com','northwestern.edu','wikipedia.org','inc.com','crainschicago.com','chicagobusiness.com'}
+
+def _norm(s:str)->str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if ord(ch) < 0x0300).lower()
+
+def _is_bio_prompt(prompt:str)->bool:
+    q = (prompt or '').lower()
+    return any(k in q for k in ('who is','about','bio','profile','background'))
+
+def _is_strategy_prompt(prompt:str)->bool:
+    q = (prompt or '').lower()
+    return ('ai' in q and 'strategy' in q) or 'need an ai' in q or 'ai plan' in q
+
+def _looks_email(t:str)->bool:
+    return bool(re.search(r'(?im)^(from|to|cc|bcc|subject|date):', t or ""))
+
+def _load_corpus(limit:int|None=None)->list[dict]:
+    out=[]
+    if not CONTENT.exists(): return out
+    with open(CONTENT, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            try:
+                out.append(json.loads(line))
+                if limit and len(out)>=limit: break
+            except: pass
+    return out
+
+def _clean_title(t:str|None)->str:
+    if not t: return "Source"
+    # drop trailing “chunk N”
+    t = re.sub(r'\s*-\s*chunk\s*\d+\s*$', '', t, flags=re.I)
+    t = re.sub(r'\s*chunk\s*\d+\s*$', '', t, flags=re.I).strip()
+    # de-shout: ALL CAPS → Title Case
+    if t and t.upper()==t:
+        t = t.title()
+    return t or "Source"
+
+def _ok_public(rec:dict)->bool:
+    name=_norm(rec.get("source_name"))
+    text=_norm(rec.get("text"))
+    if _looks_email(rec.get("text","")): return False
+    if any(b in name or b in text for b in BAD_TERMS): return False
+    if any(g in name for g in GOOD_HINTS): return True
+    if any(g in text for g in GOOD_HINTS): return True
+    return False
+
+def _domain_ok(u:str)->bool:
+    try:
+        host = re.sub(r'^https?://','',u).split('/')[0].lower()
+        return any(host.endswith(d) for d in SAFE_DOMAINS)
+    except: return False
+
+def _select_chunks(prompt:str, public:bool, k:int=6)->tuple[list[dict],list[dict]]:
+    rows=_load_corpus(limit=80000)
+    q=_norm(prompt)
+    terms=set(re.findall(r"[a-zA-Z]{3,}", q))
+    scored=[]
+    for r in rows:
+        if public and not _ok_public(r): continue
+        txt=(r.get("text") or "")
+        low=txt.lower()
+        boost=5 if ("tullman" in ((r.get("source_name") or "") + " " + low)) else 0
+        sc=boost + sum(low.count(t) for t in terms)
+        if sc>0: scored.append((sc, r))
+    scored.sort(key=lambda x:x[0], reverse=True)
+    top=[r for _,r in scored[:k]]
+
+    url_sources=[]; seen=set()
+    for r in top:
+        u=r.get("url") or ""
+        if public and u and not _domain_ok(u):  # public only shows whitelisted domains
+            continue
+        if u and u not in seen:
+            url_sources.append({"title":_clean_title(r.get("title") or r.get("source_name") or u), "url":u})
+            seen.add(u)
+    return top, url_sources
+
+def _facts_from(chunks:list[dict], max_facts:int=8)->str:
+    """Short, neutral bullets; drop ceremony/speech-y lines."""
+    facts=[]; seen=set()
+    for r in chunks:
+        t=(r.get("text") or "")
+        for s in re.split(r'(?<=[.!?])\s+', t)[:2]:
+            s=s.strip()
+            if not s: continue
+            low=s.lower()
+            if low.startswith(("by ","photo:","copyright")): continue
+            if any(b in low for b in BAD_TERMS): continue
+            if s in seen: continue
+            seen.add(s); facts.append(f"- {s}")
+            if len(facts)>=max_facts: break
+        if len(facts)>=max_facts: break
+    return "\n".join(facts)
+
+# --- simple web fallback ---
+def _search_web(query:str, site:str|None=None, top:int=4)->list[dict]:
+    q = f"site:{site} {query}" if site else query
+    r = requests.post("https://duckduckgo.com/html/", data={"q":q}, headers={"User-Agent":UA}, timeout=8)
+    soup=BeautifulSoup(r.text,"lxml")
+    items=[]
+    for a in soup.select(".result__a")[:top]:
+        href=a.get("href"); txt=a.get_text(" ", strip=True)
+        if href and txt: items.append({"name":txt, "url":href})
+    return items
+
+def _fetch(url:str, max_chars:int=6000)->str:
+    try:
+        r=requests.get(url, headers={"User-Agent":UA}, timeout=10); r.raise_for_status()
+        soup=BeautifulSoup(r.text,"lxml")
+        for t in soup(["script","style","noscript"]): t.decompose()
+        return soup.get_text(" ", strip=True)[:max_chars]
+    except: return ""
+
+def _web_fallback(prompt:str)->tuple[str,list[dict]]:
+    texts=[]; srcs=[]
+    for site in ("howardtullman.com","northwestern.edu","inc.com","wikipedia.org"):
+        for h in _search_web(prompt, site, top=4)[:2]:
+            u=h.get("url") or ""; 
+            if not u or not _domain_ok(u): continue
+            txt=_fetch(u)
+            if len(txt)>=400: texts.append(txt[:3000]); srcs.append({"title":_clean_title(h.get("name")), "url":u})
+    if texts: return " ".join(texts)[:6000], srcs
+    return "", []
+
+# --- GPT-5 + fallbacks ---
+def _quality_gate(md:str)->bool:
+    bad = [
+        re.search(r'(?i)#\s*answer', md),
+        re.search(r'\bI\s+takes\b|\bI\s+has\b|\bI\s+does\b', md),
+        re.search(r'(?i)\bHoward\s+Tullman\b.*\bI\b|\bI\b.*\bHoward\s+Tullman\b', md),
+    ]
+    return not any(bad)
+
+def _curated_fallback(prompt:str)->str:
+    p=_norm(prompt)
+    if _is_bio_prompt(prompt):
+        return ("Hi — I’m Howard Tullman. I’m a Chicago-based entrepreneur, operator, and investor. "
+                "I led 1871, helped build Tribeca Flashpoint Academy, and turned around Kendall College. "
+                "Earlier I founded or ran CCC Information Services, Tunes.com, and The Cobalt Group. "
+                "I mentor founders, invest in scrappy teams, and I believe AI is now table stakes for every business and for individuals.")
+    if _is_strategy_prompt(prompt):
+        return ("AI is how you compound advantage—speed, coverage, consistency, and a learning loop from your own work. "
+                "Start with one painful process, ship a small assist this quarter, measure, and scale what works. "
+                "Keep humans in the loop early, cite your sources, and protect data.")
+    if 'proud' in p:
+        return ("I’m proudest of the people and platforms we built—1871; the turnarounds at Kendall and Tribeca Flashpoint; "
+                "and the founders I’ve mentored. The impact—careers, customers, execution—outlasts me.")
+    return ("Hi — I’m Howard Tullman. Tell me the outcome you want and the constraint in your way—"
+            "we’ll ship one small win this quarter and scale the ones that work.")
+
+def _gpt5_rewrite(question:str, facts:str, prior:str, links:list[dict])->str:
+    try:
+        import openai
+        openai.api_key = os.environ["OPENAI_API_KEY"]
+        model = os.getenv("OPENAI_MODEL", "gpt-5-thinking")
+        sysmsg = ("You are Howard Tullman. Speak in first person (I, my). "
+                  "Be warm, candid, direct, optimistic, and concise. "
+                  "Return clean Markdown. Do not add '# Answer'. "
+                  "Fix subject–verb agreement; avoid repeating article titles; no third-person self-reference.")
+        link_md = "\n".join(f"- {l['title']}: {l['url']}" for l in links) if links else ""
+        user = f"QUESTION:\n{question}\n\nFACTS:\n{facts or '(none)'}\n\nCONTEXT:\n{prior or '(none)'}\n\nLINKS (cite if relevant):\n{link_md}"
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role":"system","content":sysmsg},
+                      {"role":"user","content":user}],
+            temperature=0.2,
+        )
+        return (resp["choices"][0]["message"]["content"] or "").strip()
+    except Exception:
+        return _curated_fallback(question)
+
+def _prefer_links(prompt:str, links:list[dict], max_links:int=2)->list[dict]:
+    """Prefer Wikipedia for bio asks; filter low-signal blog links; dedupe; cap."""
+    out = links[:] if links else []
+    if _is_bio_prompt(prompt) and not any('wikipedia.org' in (l.get('url') or '') for l in out):
+        out = [{'title':'Wikipedia: Howard A. Tullman','url': WIKI_URL}] + out
+    def good(l):
+        t = (l.get('title') or '').lower()
+        u = (l.get('url') or '')
+        if not u: return False
+        if any(b in t for b in ('top toady','toady')): return False
+        return True
+    out = [l for l in out if good(l)]
+    # de-dupe + cap
+    seen=set(); clean=[]
+    for l in out:
+        u=l['url']
+        if u in seen: continue
+        seen.add(u)
+        l['title'] = _clean_title(l.get('title') or u)
+        clean.append(l)
+        if len(clean) >= (1 if _is_bio_prompt(prompt) else max_links): break
+    return clean
+
+def compose(prompt:str, public:bool=True, prior:str="")->tuple[str,list[dict]]:
+    """
+    Compose a polished first-person answer (Howard) and URL chips (public).
+    JSON-first (strict public filter, whitelisted domains for links)
+    -> web fallback -> GPT-5 rewrite -> quality gate -> curated fallback.
+    """
+    # Short-circuit facts for the two most common asks (prevents ceremony bleed)
+    curated_facts = ""
+    if _is_bio_prompt(prompt):
+        curated_facts = ("\n".join([
+            "- CEO of 1871 (2014–2018); expanded Chicago’s startup hub",
+            "- Led turnarounds at Kendall College and Tribeca Flashpoint Academy",
+            "- Founder/operator roles at CCC Information Services, Tunes.com, The Cobalt Group",
+            "- Collector/donor of contemporary realist art (1,300+ works)",
+            "- Prolific writer on execution and practical strategy"
+        ]))
+    elif _is_strategy_prompt(prompt):
+        curated_facts = ("\n".join([
+            "- AI increases speed, coverage, consistency, and learning",
+            "- Start small: ship one assist this quarter and measure it",
+            "- Keep humans in the loop early; cite sources; protect data",
+            "- Scale only what works and make it a habit"
+        ]))
+
+    # 1) JSON-first with strict public filter
+    chunks, url_sources = _select_chunks(prompt, public=public, k=6)
+    facts = curated_facts or _facts_from(chunks)
+    links = url_sources.copy()
+
+    # 2) If no JSON facts (public), try web fallback
+    if public and not facts:
+        ctx_web, links_web = _web_fallback(prompt)
+        facts = ctx_web or facts
+        links = links_web or links
+        if not links and _is_bio_prompt(prompt):
+            links = [{"title":"Wikipedia: Howard A. Tullman","url": WIKI_URL}]
+
+    # 3) GPT-5 rewrite -> quality gate -> curated fallback if needed
+    md = _gpt5_rewrite(prompt, facts, prior, links)
+    if not _quality_gate(md):
+        md = _gpt5_rewrite(prompt + "\n\nPOLISH:\nFix any verb agreement and remove third-person mentions of my name.", facts, prior, links)
+    if not _quality_gate(md):
+        md = _curated_fallback(prompt)
+
+    # 4) Public chips: URLs only, prefer bio link, cap to 1–2
+    if public:
+        links = [s for s in links if s.get("url")]
+        links = _prefer_links(prompt, links, max_links=2)
+
+    return md, links

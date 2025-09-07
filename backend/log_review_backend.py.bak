@@ -1,0 +1,519 @@
+import os, json
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+from flask import Flask, request, jsonify, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event
+from sqlalchemy.dialects.sqlite import JSON as SQLITE_JSON
+
+# ----------------------------
+# Config
+# ----------------------------
+DB_PATH = os.environ.get("TULLMAN_DB_PATH", "/home/kmages/tullman/app.db")
+ARCHIVE_JSONL = os.environ.get("TULLMAN_ARCHIVE_JSONL", "/home/kmages/tullman/archive/archive.jsonl")
+CAPTURE_EXCLUDED_QUESTIONS = os.environ.get("TULLMAN_CAPTURE_EXCLUDED_QUESTIONS", "1") == "1"
+AUTO_PURGE_WEEKS: Optional[int] = int(os.environ.get("TULLMAN_AUTO_PURGE_WEEKS", "0")) or None
+FRONTEND_DIR = os.environ.get("TULLMAN_FRONTEND_DIR", "/home/kmages/tullman/frontend")
+
+Path(ARCHIVE_JSONL).parent.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
+
+# ----------------------------
+# Models
+# ----------------------------
+class QAPair(db.Model):
+    __tablename__ = "qa_pairs"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    date_id = db.Column(db.String(32), index=True)
+
+    question = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, default="")
+
+    user_name = db.Column(db.String(120))
+    user_email = db.Column(db.String(256))
+
+    is_locked_example = db.Column(db.Boolean, default=False)
+    triggered_by_button = db.Column(db.Boolean, default=False)
+    is_excluded = db.Column(db.Boolean, default=False)
+    excluded_reason = db.Column(db.String(64))
+
+    status = db.Column(db.String(32), default="active", index=True)
+    source = db.Column(db.String(64))
+
+    matched_example_id = db.Column(db.Integer, db.ForeignKey("examples.id"))
+    matched_example = db.relationship("Example", backref="qa_refs")
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "date_id": self.date_id,
+            "created_at": self.created_at.isoformat() + "Z",
+            "question": self.question,
+            "answer": self.answer,
+            "user_name": self.user_name,
+            "user_email": self.user_email,
+            "is_locked_example": self.is_locked_example,
+            "triggered_by_button": self.triggered_by_button,
+            "is_excluded": self.is_excluded,
+            "excluded_reason": self.excluded_reason,
+            "status": self.status,
+            "source": self.source,
+            "matched_example_id": self.matched_example_id,
+        }
+
+class ReviewQueue(db.Model):
+    __tablename__ = "review_queue"
+    id = db.Column(db.Integer, primary_key=True)
+    qa_id = db.Column(db.Integer, db.ForeignKey("qa_pairs.id"), unique=True, index=True, nullable=False)
+    enqueued_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    qa = db.relationship("QAPair", backref="review_item", uselist=False)
+
+class Example(db.Model):
+    __tablename__ = "examples"
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    label = db.Column(db.String(200))
+    primary_question = db.Column(db.Text, nullable=False)
+    answer = db.Column(db.Text, nullable=False)
+    aliases = db.Column(SQLITE_JSON, default=list)
+    active = db.Column(db.Boolean, default=True)
+    locked = db.Column(db.Boolean, default=True)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "created_at": self.created_at.isoformat() + "Z",
+            "updated_at": self.updated_at.isoformat() + "Z" if self.updated_at else None,
+            "label": self.label,
+            "primary_question": self.primary_question,
+            "answer": self.answer,
+            "aliases": self.aliases or [],
+            "active": self.active,
+            "locked": self.locked,
+        }
+
+with app.app_context():
+    db.create_all()
+
+@event.listens_for(QAPair, "after_insert")
+def set_date_id(mapper, connection, target: QAPair):
+    date_part = target.created_at.strftime("%Y-%m-%d")
+    padded = f"{target.id:06d}"
+    connection.execute(
+        QAPair.__table__.update()
+        .where(QAPair.id == target.id)
+        .values(date_id=f"{date_part}-{padded}")
+    )
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def _maybe_purge():
+    if not AUTO_PURGE_WEEKS:
+        return
+    cutoff = datetime.utcnow() - timedelta(weeks=AUTO_PURGE_WEEKS)
+    old = QAPair.query.filter(
+        QAPair.created_at < cutoff,
+        QAPair.status.in_(["deleted","archived"])
+    ).all()
+    for it in old:
+        db.session.delete(it)
+    db.session.commit()
+
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _example_match(q: str):
+    nq = _norm(q)
+    if not nq:
+        return None
+    exs = Example.query.filter(Example.active == True).all()  # noqa: E712
+    for e in exs:
+        if _norm(e.primary_question) == nq:
+            return e
+        for al in (e.aliases or []):
+            if _norm(al) == nq:
+                return e
+    return None
+
+# ----------------------------
+# Sensitive denylist
+# ----------------------------
+SENSITIVE_QA = [{
+    "q": "Where was Howard on 9/11?",
+    "a": "I was in my Xceed office in New York City, less than two blocks from the Twin Towers when they came down."
+}]
+def _is_sensitive(q: str, a: str) -> bool:
+    qn = (q or '').strip()
+    an = (a or '').strip()
+    for item in SENSITIVE_QA:
+        iq = (item.get('q') or '').strip()
+        ia = (item.get('a') or '').strip()
+        if iq and ia and qn == iq and an == ia: return True
+        if iq and qn == iq: return True
+        if ia and an == ia: return True
+    return False
+
+# ----------------------------
+# Examples API
+# ----------------------------
+@app.route("/api/examples", methods=["GET"])
+def list_examples():
+    items = Example.query.order_by(Example.created_at.asc()).all()
+    return jsonify({"items": [e.as_dict() for e in items], "count": len(items)})
+
+@app.route("/api/examples", methods=["POST"])
+def create_example():
+    d = request.get_json(force=True) or {}
+    pq = (d.get("primary_question") or "").strip()
+    ans = (d.get("answer") or "").strip()
+    if not pq or not ans:
+        return jsonify({"error":"primary_question and answer are required"}), 400
+    ex = Example(
+        label=d.get("label"),
+        primary_question=pq,
+        answer=ans,
+        aliases=d.get("aliases") or [],
+        active=bool(d.get("active", True)),
+        locked=bool(d.get("locked", True)),
+    )
+    db.session.add(ex); db.session.commit()
+    return jsonify({"ok":True,"example":ex.as_dict()}), 201
+
+@app.route("/api/examples/<int:ex_id>", methods=["PATCH"])
+def update_example(ex_id: int):
+    ex = Example.query.get(ex_id)
+    if not ex:
+        return jsonify({"error":"not_found"}), 404
+    d = request.get_json(force=True) or {}
+    if "label" in d: ex.label = d["label"]
+    if "primary_question" in d: ex.primary_question = d["primary_question"]
+    if "answer" in d: ex.answer = d["answer"]
+    if "aliases" in d: ex.aliases = d["aliases"] or []
+    if "active" in d: ex.active = bool(d["active"])
+    if "locked" in d: ex.locked = bool(d["locked"])
+    db.session.commit()
+    return jsonify({"ok":True,"example":ex.as_dict()})
+
+@app.route("/api/examples/match", methods=["GET"])
+def match_example():
+    q = request.args.get("q", "").strip()
+    ex = _example_match(q)
+    return jsonify({"matched": bool(ex), "example": ex.as_dict() if ex else None})
+
+# ----------------------------
+# Log + Review APIs (with sensitive guard)
+# ----------------------------
+@app.route("/api/log/ingest", methods=["POST"])
+def ingest():
+    d = request.get_json(force=True) or {}
+    q = (d.get("question") or "").strip()
+    a = (d.get("answer") or "").strip()
+    if not q:
+        return jsonify({"error": "question is required"}), 400
+
+    matched_example_id = d.get("matched_example_id")
+    matched_example = Example.query.get(int(matched_example_id)) if matched_example_id else _example_match(q)
+
+    is_locked_example = bool(d.get("is_locked_example", False))
+    triggered_by_button = bool(d.get("triggered_by_button", False))
+
+    if matched_example and matched_example.active and matched_example.locked:
+        is_locked_example = True
+        a = matched_example.answer
+
+    excluded_reason = "locked_example" if is_locked_example else ("button_trigger" if triggered_by_button else None)
+    is_excluded = bool(excluded_reason)
+
+    # Sensitive guard (always wins)
+    if _is_sensitive(q, a):
+        is_excluded = True
+        excluded_reason = "sensitive"
+        a = ""
+
+    qa = QAPair(
+        question=q, answer=a,
+        user_name=d.get("user_name"), user_email=d.get("user_email"),
+        is_locked_example=is_locked_example, triggered_by_button=triggered_by_button,
+        is_excluded=is_excluded, excluded_reason=excluded_reason,
+        source=d.get("source", "front_page"),
+        matched_example_id=matched_example.id if matched_example else None,
+    )
+    db.session.add(qa); db.session.commit()
+    try: _maybe_purge()
+    except Exception: pass
+    return jsonify({"ok": True, "qa": qa.as_dict()}), 201
+
+@app.route("/api/log", methods=["GET"])
+def list_log():
+    include_excluded = str(request.args.get("include_excluded","0")) == "1"
+    include_sensitive = str(request.args.get("include_sensitive","0")) == "1"
+    status = request.args.get("status")
+    limit = int(request.args.get("limit","50"))
+    offset = int(request.args.get("offset","0"))
+
+    q = QAPair.query
+    if not include_excluded:
+        q = q.filter(QAPair.is_excluded == False)  # noqa: E712
+    else:
+        if not include_sensitive:
+            q = q.filter( (QAPair.is_excluded == False) | (QAPair.excluded_reason != "sensitive") )
+
+    if status:
+        q = q.filter(QAPair.status == status)
+
+    items = q.order_by(QAPair.created_at.desc()).offset(offset).limit(limit).all()
+    return jsonify({"items":[it.as_dict() for it in items],"count":len(items),"limit":limit,"offset":offset})
+
+@app.route("/api/log/<int:qa_id>/action", methods=["PATCH"])
+def log_action(qa_id: int):
+    d = request.get_json(force=True) or {}
+    action = (d.get("action") or "").strip().lower()
+
+    qa = QAPair.query.get(qa_id)
+    if not qa:
+        return jsonify({"error":"not_found"}), 404
+    if qa.is_excluded and action not in ("delete",):
+        return jsonify({"error":"excluded_item"}), 400
+
+    if action == "archive":
+        qa.status = "archived"; db.session.commit()
+        Path(ARCHIVE_JSONL).parent.mkdir(parents=True, exist_ok=True)
+        with open(ARCHIVE_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"archived_at": datetime.utcnow().isoformat()+"Z", **qa.as_dict()}, ensure_ascii=False) + "\n")
+        msg = "Archived and appended to archive JSONL."
+    elif action == "delete":
+        qa.status = "deleted"; db.session.commit(); msg = "Marked as deleted."
+    elif action == "queue":
+        if not ReviewQueue.query.filter_by(qa_id=qa.id).first():
+            db.session.add(ReviewQueue(qa_id=qa.id))
+        qa.status = "queued"; db.session.commit(); msg = "Queued for review."
+    elif action == "restore":
+        qa.status = "restored"; db.session.commit(); msg = "Restored to Front Page."
+    elif action == "send_to_loop2":
+        rq = ReviewQueue.query.filter_by(qa_id=qa.id).first()
+        if rq: db.session.delete(rq)
+        qa.status = "in_loop2"; db.session.commit()
+        payload = {"loop2_prefill": {"box1": qa.question, "box2": qa.answer, "box3": qa.answer}}
+        return jsonify({"ok": True, "message": "Sent to Loop2.", "qa": qa.as_dict(), **payload})
+    else:
+        return jsonify({"error":"unknown_action"}), 400
+
+    return jsonify({"ok": True, "message": msg, "qa": qa.as_dict()})
+
+@app.route("/api/review-queue", methods=["GET"])
+def list_review_queue():
+    items = (db.session.query(ReviewQueue).order_by(ReviewQueue.enqueued_at.asc()).all())
+    out = []
+    for it in items:
+        qa = it.qa.as_dict()
+        qa["queued_at"] = it.enqueued_at.isoformat() + "Z"
+        out.append(qa)
+    return jsonify({"items": out, "count": len(out)})
+
+@app.route("/api/review-queue/send/<int:qa_id>", methods=["POST"])
+def send_to_loop2(qa_id: int):
+    qa = QAPair.query.get(qa_id)
+    if not qa: return jsonify({"error":"not_found"}), 404
+    rq = ReviewQueue.query.filter_by(qa_id=qa_id).first()
+    if rq: db.session.delete(rq)
+    qa.status = "in_loop2"; db.session.commit()
+    payload = {"loop2_prefill": {"box1": qa.question, "box2": qa.answer, "box3": qa.answer}}
+    return jsonify({"ok": True, "message": "Sent to Loop2.", "qa": qa.as_dict(), **payload})
+
+@app.route("/api/counters", methods=["GET"])
+def counters():
+    now = datetime.utcnow()
+    sod = datetime(now.year, now.month, now.day)
+    review_count = ReviewQueue.query.count()
+    log_total = QAPair.query.filter(QAPair.is_excluded == False).count()  # noqa: E712
+    log_today = QAPair.query.filter(QAPair.is_excluded == False, QAPair.created_at >= sod).count()
+    return jsonify({"review_queue": review_count, "log_total": log_total, "log_today": log_today})
+
+# ----------------------------
+# Admin endpoints: sensitive purge/count
+# ----------------------------
+@app.route("/api/admin/count_sensitive", methods=["GET"])
+def admin_count_sensitive():
+    iq = "Where was Howard on 9/11?"
+    ia = "I was in my Xceed office in New York City, less than two blocks from the Twin Towers when they came down."
+    c = QAPair.query.filter((QAPair.question == iq) | (QAPair.answer == ia)).count()
+    return jsonify({"ok": True, "count": c})
+
+@app.route("/api/admin/sanitize_sensitive", methods=["POST"])
+def admin_sanitize_sensitive():
+    iq = "Where was Howard on 9/11?"
+    ia = "I was in my Xceed office in New York City, less than two blocks from the Twin Towers when they came down."
+    rows = QAPair.query.filter((QAPair.question == iq) | (QAPair.answer == ia)).all()
+    removed = 0
+    for it in rows:
+        db.session.delete(it); removed += 1
+    db.session.commit()
+    return jsonify({"ok": True, "removed": removed, "reason": "sensitive"})
+
+# ----------------------------
+# Static frontend
+# ----------------------------
+@app.route("/frontend/<path:path>")
+def frontend_files(path):
+    return send_from_directory(FRONTEND_DIR, path)
+
+@app.route("/log")
+def log_page():
+    return send_from_directory(FRONTEND_DIR, "log.html")
+
+@app.route("/review")
+def review_page():
+    return send_from_directory(FRONTEND_DIR, "review.html")
+
+@app.route("/examples")
+def examples_page():
+    return send_from_directory(FRONTEND_DIR, "examples.html")
+
+# Health
+
+@app.route("/api/examples/recover_from_log", methods=["POST"])
+def examples_recover_from_log():
+    body = request.get_json(force=True) or {}
+    min_count  = int(body.get("min_count", 2))
+    limit_max  = int(body.get("limit_max", 500))
+    include_status = body.get("include_status") or ["active","archived","restored","queued","in_loop2"]
+
+    from collections import defaultdict, Counter
+    q_to_answers = defaultdict(Counter)
+
+    rows = (QAPair.query
+            .filter(QAPair.is_excluded == False)   # noqa: E712
+            .filter(QAPair.status.in_(include_status))
+            .order_by(QAPair.created_at.desc())
+            .all())
+
+    for it in rows:
+        q = (it.question or "").strip()
+        a = (it.answer  or "").strip()
+        if q and a:
+            q_to_answers[q][a] += 1
+
+    cands = []
+    for q, ctr in q_to_answers.items():
+        a, cnt = ctr.most_common(1)[0]
+        if cnt >= min_count:
+            cands.append((q, a, cnt))
+    cands.sort(key=lambda x: x[2], reverse=True)
+    cands = cands[:limit_max]
+
+    def _norm(x): return (x or '').strip().lower()
+    existing = Example.query.all()
+    created = updated = 0
+    for q, a, cnt in cands:
+        ex = next((e for e in existing if _norm(e.primary_question) == _norm(q)), None)
+        if ex:
+            ex.answer = a
+            ex.locked = True
+            ex.active = True
+            updated += 1
+        else:
+            new_ex = Example(primary_question=q, answer=a, aliases=[], active=True, locked=True)
+            db.session.add(new_ex)
+            created += 1
+    db.session.commit()
+    return jsonify({"ok": True, "created": created, "updated": updated, "considered": len(rows), "promoted": len(cands)})
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "service": "log_review_backend"})
+
+@app.route("/api/examples/export", methods=["GET"])
+def examples_export():
+    items = Example.query.order_by(Example.created_at.asc()).all()
+    lines = [json.dumps(e.as_dict(), ensure_ascii=False) for e in items]
+    return ("\n".join(lines) + ("\n" if lines else "")), 200, {"Content-Type": "application/jsonl; charset=utf-8"}
+
+@app.route("/api/examples/bulk_upsert", methods=["POST"])
+def examples_bulk_upsert():
+    data = request.get_json(force=True) or {}
+    rows = data.get("items") or []
+    if not isinstance(rows, list):
+        return jsonify({"error":"items must be an array"}), 400
+
+    def _norm(s): return (s or "").strip().lower()
+    existing = Example.query.all()
+    created = updated = 0
+    for r in rows:
+        pq  = (r.get("primary_question") or "").strip()
+        ans = (r.get("answer") or "").strip()
+        if not pq or not ans:
+            continue
+        ex = next((e for e in existing if _norm(e.primary_question) == _norm(pq)), None)
+        if ex:
+            ex.answer  = ans
+            ex.aliases = r.get("aliases") or ex.aliases or []
+            if "label"  in r: ex.label  = r["label"]
+            if "active" in r: ex.active = bool(r["active"])
+            if "locked" in r: ex.locked = bool(r["locked"])
+            updated += 1
+        else:
+            ne = Example(primary_question=pq,
+                         answer=ans,
+                         aliases=r.get("aliases") or [],
+                         label=r.get("label"),
+                         active=bool(r.get("active", True)),
+                         locked=bool(r.get("locked", True)))
+            db.session.add(ne); created += 1
+    db.session.commit()
+    return jsonify({"ok": True, "created": created, "updated": updated})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5057, debug=False)
+
+@app.route("/api/examples/export", methods=["GET"])
+def examples_export():
+    items = Example.query.order_by(Example.created_at.asc()).all()
+    lines = [json.dumps(e.as_dict(), ensure_ascii=False) for e in items]
+    return ("\n".join(lines) + ("\n" if lines else "")), 200, {"Content-Type": "application/jsonl; charset=utf-8"}
+
+@app.route("/api/examples/bulk_upsert", methods=["POST"])
+def examples_bulk_upsert():
+    data = request.get_json(force=True) or {}
+    rows = data.get("items") or []
+    if not isinstance(rows, list) or not rows:
+        return jsonify({"error":"items (array) required"}), 400
+
+    def _norm(s): return (s or "").strip().lower()
+    existing = Example.query.all()
+    created = updated = 0
+
+    for r in rows:
+        pq  = (r.get("primary_question") or "").strip()
+        ans = (r.get("answer") or "").strip()
+        if not pq or not ans:  # skip incomplete
+            continue
+        ex = next((e for e in existing if _norm(e.primary_question) == _norm(pq)), None)
+        if ex:
+            ex.answer  = ans
+            ex.aliases = r.get("aliases") or ex.aliases or []
+            if "label"  in r: ex.label  = r["label"]
+            if "active" in r: ex.active = bool(r["active"])
+            if "locked" in r: ex.locked = bool(r["locked"])
+            updated += 1
+        else:
+            ne = Example(primary_question=pq,
+                         answer=ans,
+                         aliases=r.get("aliases") or [],
+                         label=r.get("label"),
+                         active=bool(r.get("active", True)),
+                         locked=bool(r.get("locked", True)))
+            db.session.add(ne); created += 1
+
+    db.session.commit()
+    return jsonify({"ok": True, "created": created, "updated": updated})

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><title>Review Queue</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:2rem;background:#fafafa}
+    h1{margin-bottom:1rem}.counter{font-weight:bold;margin-bottom:1rem}
+    .qa{border:1px solid #ccc;padding:1rem;margin-bottom:1rem;background:#fff}
+    .buttons{margin-top:.5rem}button{margin-right:.5rem;padding:.4rem .8rem}
+    .msg{margin-top:.5rem;font-size:.9em;color:#333}
+  </style>
+</head>
+<body>
+  <h1>Review Queue</h1>
+  <div class="counter" id="counter">Loading…</div>
+  <div id="queue"></div>
+  <script>
+    async function api(p,o={}){
+      const r=await fetch(p,{headers:{'Content-Type':'application/json'},...o});
+      const ct=r.headers.get('content-type')||'';
+      const b=ct.includes('application/json')?await r.json():await r.text();
+      return b;
+    }
+    async function load(){
+      try{
+        const d=await api('/api/review-queue');
+        document.getElementById('counter').textContent=;
+        const box=document.getElementById('queue'); box.innerHTML='';
+        d.items.forEach(it=>{
+          const div=document.createElement('div'); div.className='qa';
+          div.innerHTML=;
+          const btns=document.createElement('div'); btns.className='buttons';
+          const msg=document.createElement('div'); msg.className='msg';
+          const mk=(label,action)=>{ const b=document.createElement('button'); b.textContent=label;
+            b.onclick=async()=>{ b.disabled=true; msg.textContent=label+`…`; try{
+              await api(,{method:'PATCH',body:JSON.stringify({action})});
+              msg.textContent=label+' done.'; setTimeout(load,400);
+            }catch(e){ msg.textContent=label+` failed`; } finally{ b.disabled=false; } }; return b; };
+          btns.append(mk('Send to Loop2','send_to_loop2'), mk('Archive','archive'), mk('Delete','delete'));
+          div.append(btns,msg); box.append(div);
+        });
+      }catch(e){
+        document.getElementById('counter').textContent='Review Queue (unavailable)';
+        document.getElementById('queue').innerHTML='<em>Failed to load.</em>'; }
+    }
+    load();
+  </script>
+</body>
+</html>

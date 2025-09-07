@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Examples Admin</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom: 16px; }
+    .toast { min-height: 1.2em; }
+    .grid { display:grid; grid-template-columns: 1fr; gap: 12px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:12px; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .row > div { display:flex; flex-direction:column; gap:6px; }
+    input[type=text], textarea { width:100%; padding:8px; border:1px solid #ccc; border-radius:8px; }
+    textarea { min-height: 80px; }
+    .badge { font-weight:600; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; }
+    button { padding:8px 12px; border:1px solid #ccc; border-radius:8px; background:white; cursor:pointer; }
+    button.spinning::after { content:" …"; }
+    .pill { display:inline-block; padding:4px 8px; border-radius:999px; border:1px solid #ccc; margin-right:6px; margin-bottom:6px; font-size:.9em; }
+    .pill.locked { background:#fff6e6; border-color:#f0c36d; }
+    .pill.active { background:#eaffea; border-color:#7ed37e; }
+    .pill.inactive { background:#f7f7f7; color:#777; }
+    .list { display:grid; gap:12px; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="badge" data-review-queue-header>Review Queue (0 items pending)</div>
+    <div class="toast" data-toast></div>
+  </div>
+
+  <!-- Create new Example -->
+  <div class="card">
+    <h3>Create Example</h3>
+    <div class="row">
+      <div>
+        <label>Primary Question</label>
+        <input id="newQ" type="text" placeholder="Exact question that should trigger the canonical answer"/>
+      </div>
+      <div>
+        <label>Aliases (comma-separated)</label>
+        <input id="newAliases" type="text" placeholder="e.g. Tell me about Tullman.ai, Tullman AI"/>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <div style="grid-column:1 / -1;">
+        <label>Canonical Answer (served as-is, excluded from Log) </label>
+        <textarea id="newA" placeholder="Exact answer to return for this Example"></textarea>
+      </div>
+    </div>
+    <div class="actions" style="margin-top:10px;">
+      <button id="btnCreate">Create (locked & active)</button>
+    </div>
+  </div>
+
+  <!-- Existing Examples -->
+  <div class="card">
+    <h3>Examples</h3>
+    <div id="examplesList" class="list"></div>
+  </div>
+
+  <button id="btnTop" style="position:fixed; right:24px; bottom:24px;">Back to top</button>
+
+  <script type="module" src="/frontend/examples.js"></script>
+</body>
+</html>
